@@ -1,0 +1,1 @@
+Only model/model.py and model/transformer.py will be uploaded. No zip or data directory.
