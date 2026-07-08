@@ -1,1 +1,0 @@
-Scope: model/model.py and model/transformer.py only. Exclude archives and data.
