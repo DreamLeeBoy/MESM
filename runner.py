@@ -339,7 +339,7 @@ def build_criterion(args):
         # recfw_margin=args.recfw_margin,
         multi_clip=args.dataset_name in ["qvhighlights"],
         gamma=args.iou_gamma,
-        recss_tau=args.recss_tau,
+        recss_tau=args.recss_tau
     )
     criterion.to(args.device)
     return criterion

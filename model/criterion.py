@@ -18,7 +18,11 @@ class Criterion(nn.Module):
                  rank_coef, use_triplet,
                  saliency_margin=1,
                  multi_clip=False,
-                 gamma=0.9, recss_tau=0.5):
+                 gamma=0.9, recss_tau=0.5,
+                 bg_rank_margin=0.2,
+                 bg_iou_threshold=0.1,
+                 bg_candidate_centers=39,
+                 bg_candidate_widths=(0.05, 0.10, 0.15, 0.20, 0.30)):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -55,6 +59,15 @@ class Criterion(nn.Module):
         self.multi_clip = multi_clip
         self.gamma = gamma
         self.recss_tau = recss_tau
+
+        # Background-aware matched-query ranking loss.
+        # This is intentionally lightweight: it keeps the original 10-query
+        # foreground competition unchanged and only discourages high foreground
+        # scores on predictions that mainly overlap GT-external background.
+        self.bg_rank_margin = bg_rank_margin
+        self.bg_iou_threshold = bg_iou_threshold
+        self.bg_candidate_centers = bg_candidate_centers
+        self.bg_candidate_widths = tuple(bg_candidate_widths)
     
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
@@ -355,7 +368,7 @@ class Criterion(nn.Module):
                 #     indices = None
                 #     losses_target = ["saliency"]    
                 for loss in losses_target:
-                    if loss in ["saliency", "rec_ss", "rec_fw"]:
+                    if loss in ["saliency", "bg_rank", "rec_ss", "rec_fw"]:
                         continue
                     kwargs = {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, **kwargs)

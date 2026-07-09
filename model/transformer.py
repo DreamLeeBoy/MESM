@@ -37,7 +37,7 @@ def inverse_sigmoid(x, eps=1e-3):
     x = x.clamp(min=0, max=1)
     x1 = x.clamp(min=eps)
     x2 = (1 - x).clamp(min=eps)
-    return torch.log(x1/x2)
+    return torch.log(x1 / x2)
 
 
 def gen_sineembed_for_position(pos_tensor, dim):
@@ -66,7 +66,7 @@ class T2VEncoder(nn.Module):
                  ):
         super().__init__()
         t2v_encoder_layer = T2V_TransformerEncoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+                                                        dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.t2v_encoder = T2V_TransformerEncoder(t2v_encoder_layer, num_encoder_layers, encoder_norm)
 
@@ -79,7 +79,7 @@ class T2VEncoder(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-    
+
     def forward(self,
                 src_txt: Tensor,
                 src_vid: Tensor,
@@ -91,13 +91,13 @@ class T2VEncoder(nn.Module):
                 pos_vid: Optional[Tensor] = None,
                 **kwargs):
         src_txt = src_txt.permute(1, 0, 2)  # (L, batch_size, d)
-        pos_txt = pos_txt.permute(1, 0, 2)   # (L, batch_size, d)
-        src_vid = src_vid.permute(1, 0, 2)   # (L, batch_size, d)
-        pos_vid = pos_vid.permute(1, 0, 2)   # (L, batch_size, d)
+        pos_txt = pos_txt.permute(1, 0, 2)  # (L, batch_size, d)
+        src_vid = src_vid.permute(1, 0, 2)  # (L, batch_size, d)
+        pos_vid = pos_vid.permute(1, 0, 2)  # (L, batch_size, d)
 
         src_vid_output = self.t2v_encoder(
             src_txt, src_vid,
-            src_txt_mask, src_txt_key_padding_mask, pos_txt, 
+            src_txt_mask, src_txt_key_padding_mask, pos_txt,
             src_vid_mask, src_vid_key_padding_mask, pos_vid,
             **kwargs
         )
@@ -106,10 +106,11 @@ class T2VEncoder(nn.Module):
 
 
 class T2VEncoder_TwoMLP(T2VEncoder):
-    def __init__(self, d_model=512, nhead=8, num_encoder_layers=6, dim_feedforward=2048, dropout=0.1, activation="relu", normalize_before=False):
+    def __init__(self, d_model=512, nhead=8, num_encoder_layers=6, dim_feedforward=2048, dropout=0.1, activation="relu",
+                 normalize_before=False):
         super().__init__(d_model, nhead, num_encoder_layers, dim_feedforward, dropout, activation, normalize_before)
         t2v_encoder_layer = T2V_TransformerEncoderLayer_TwoMLP(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+                                                               dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.t2v_encoder = T2V_TransformerEncoder(t2v_encoder_layer, num_encoder_layers, encoder_norm)
 
@@ -134,7 +135,6 @@ class Transformer(nn.Module):
         # encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         # self.t2v_encoder = TransformerEncoder(t2v_encoder_layer, num_encoder_layers, encoder_norm)
 
-
         # TransformerEncoderLayerThin
         encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
@@ -147,7 +147,8 @@ class Transformer(nn.Module):
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
                                           return_intermediate=return_intermediate_dec,
-                                          d_model=d_model, query_dim=query_dim, keep_query_pos=keep_query_pos, query_scale_type=query_scale_type,
+                                          d_model=d_model, query_dim=query_dim, keep_query_pos=keep_query_pos,
+                                          query_scale_type=query_scale_type,
                                           modulate_t_attn=modulate_t_attn,
                                           bbox_embed_diff_each_layer=bbox_embed_diff_each_layer)
 
@@ -171,13 +172,29 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     # for tvsum, add video_length in argument
-    def forward(self, src, mask, query_embed, pos_embed, global_token, global_token_pos):
+    def forward(
+            self,
+            src,
+            mask,
+            query_embed,
+            query_content_embed,
+            pos_embed,
+            global_token,
+            global_token_pos,
+            text_memory=None,
+            text_key_padding_mask=None,
+            text_pos=None,
+    ):
         """
         Args:
             src: (batch_size, L, d)
             mask: (batch_size, L)
-            query_embed: (#queries, d)
-            pos_embed: (batch_size, L, d) the same as src
+            query_embed: (#queries, 2), temporal reference points (center, width)
+            query_content_embed: (#queries, d), learnable span content
+            pos_embed: (batch_size, L, d), video positional encoding
+            text_memory: (batch_size, L_text, d), projected word features
+            text_key_padding_mask: (batch_size, L_text), True for padding
+            text_pos: (batch_size, L_text, d), text positional encoding
 
         Returns:
 
@@ -189,7 +206,7 @@ class Transformer(nn.Module):
         # flatten NxCxHxW to HWxNxC
         bs, l, d = src.shape
         src = src.permute(1, 0, 2)  # (L, batch_size, d)
-        pos_embed = pos_embed.permute(1, 0, 2)   # (L, batch_size, d)
+        pos_embed = pos_embed.permute(1, 0, 2)  # (L, batch_size, d)
         refpoint_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)  # (#queries, batch_size, d)
 
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)  # (L, batch_size, d)
@@ -198,9 +215,48 @@ class Transformer(nn.Module):
         mask_local = mask[:, 1:]
         pos_embed_local = pos_embed[1:]
 
-        tgt = torch.zeros(refpoint_embed.shape[0], bs, d, device=memory.device)
-        hs, references = self.decoder(tgt, memory_local, memory_key_padding_mask=mask_local,
-                          pos=pos_embed_local, refpoints_unsigmoid=refpoint_embed)  # (#layers, #queries, batch_size, d)
+        if query_content_embed is None:
+            # Backward-compatible fallback: zero semantic content.
+            tgt = torch.zeros(
+                refpoint_embed.shape[0], bs, d,
+                dtype=memory.dtype,
+                device=memory.device,
+            )
+        else:
+            expected_shape = (refpoint_embed.shape[0], d)
+            if tuple(query_content_embed.shape) != expected_shape:
+                raise ValueError(
+                    "query_content_embed shape error: "
+                    f"expected {expected_shape}, got {tuple(query_content_embed.shape)}"
+                )
+            tgt = query_content_embed.unsqueeze(1).repeat(1, bs, 1)
+
+        if text_memory is not None:
+            if text_memory.dim() != 3 or text_memory.shape[0] != bs or text_memory.shape[2] != d:
+                raise ValueError(
+                    "text_memory must have shape [batch_size, text_length, hidden_dim], "
+                    f"got {tuple(text_memory.shape)}"
+                )
+            text_memory = text_memory.permute(1, 0, 2)
+
+        if text_pos is not None:
+            if text_pos.dim() != 3 or text_pos.shape[0] != bs or text_pos.shape[2] != d:
+                raise ValueError(
+                    "text_pos must have shape [batch_size, text_length, hidden_dim], "
+                    f"got {tuple(text_pos.shape)}"
+                )
+            text_pos = text_pos.permute(1, 0, 2)
+
+        hs, references = self.decoder(
+            tgt,
+            memory_local,
+            memory_key_padding_mask=mask_local,
+            pos=pos_embed_local,
+            refpoints_unsigmoid=refpoint_embed,
+            text_memory=text_memory,
+            text_key_padding_mask=text_key_padding_mask,
+            text_pos=text_pos,
+        )  # (#layers, #queries, batch_size, d)
         memory_local = memory_local.transpose(0, 1)  # (batch_size, L, d)
         return hs, references, memory_local, memory_global
 
@@ -337,6 +393,9 @@ class TransformerDecoder(nn.Module):
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
                 refpoints_unsigmoid: Optional[Tensor] = None,  # num_queries, bs, 2
+                text_memory: Optional[Tensor] = None,
+                text_key_padding_mask: Optional[Tensor] = None,
+                text_pos: Optional[Tensor] = None,
                 ):
         output = tgt
 
@@ -375,13 +434,24 @@ class TransformerDecoder(nn.Module):
 
                 query_sine_embed *= (reft_cond[..., 0] / obj_center[..., 1]).unsqueeze(-1)
 
-
-            output = layer(output, memory, tgt_mask=tgt_mask,
-                           memory_mask=memory_mask,
-                           tgt_key_padding_mask=tgt_key_padding_mask,
-                           memory_key_padding_mask=memory_key_padding_mask,
-                           pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed,
-                           is_first=(layer_id == 0))
+            output = layer(
+                output,
+                memory,
+                tgt_mask=tgt_mask,
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                pos=pos,
+                query_pos=query_pos,
+                query_sine_embed=query_sine_embed,
+                text_memory=text_memory,
+                text_key_padding_mask=text_key_padding_mask,
+                text_pos=text_pos,
+                # Text is injected once at the first decoder layer.
+                # Change this to True for a layer-wise text-guided ablation.
+                attend_text=(layer_id == 0),
+                is_first=(layer_id == 0),
+            )
 
             # iter update
             if self.bbox_embed is not None:
@@ -515,9 +585,8 @@ class T2V_TransformerEncoderLayer(nn.Module):
                      src_vid_key_padding_mask: Optional[Tensor] = None,
                      pos_vid: Optional[Tensor] = None,
                      **kwargs):
-        
         # assert video_length is not None
-        
+
         # print('before src shape :', src.shape)
 
         pos_src_txt = self.with_pos_embed(src_txt, pos_txt)
@@ -580,9 +649,9 @@ class T2V_TransformerEncoderLayer_TwoMLP(T2V_TransformerEncoderLayer):
                      src_vid_key_padding_mask: Optional[Tensor] = None,
                      pos_vid: Optional[Tensor] = None,
                      is_MLM: bool = False):
-        
+
         # assert video_length is not None
-        
+
         # print('before src shape :', src.shape)
 
         pos_src_txt = self.with_pos_embed(src_txt, pos_txt)
@@ -691,7 +760,18 @@ class TransformerDecoderLayer(nn.Module):
             self.norm1 = nn.LayerNorm(d_model)
             self.dropout1 = nn.Dropout(dropout)
 
-        # Decoder Cross-Attention
+        # Learnable Span -> Text Cross-Attention.
+        # This runs after span self-attention and before video cross-attention.
+        self.text_cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+        )
+        self.text_attn_norm = nn.LayerNorm(d_model)
+        self.text_attn_dropout = nn.Dropout(dropout)
+        self.last_text_attn_weights = None
+
+        # Decoder Video Cross-Attention
         self.ca_qcontent_proj = nn.Linear(d_model, d_model)
         self.ca_qpos_proj = nn.Linear(d_model, d_model)
         self.ca_kcontent_proj = nn.Linear(d_model, d_model)
@@ -728,6 +808,10 @@ class TransformerDecoderLayer(nn.Module):
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None,
                 query_sine_embed=None,
+                text_memory: Optional[Tensor] = None,
+                text_key_padding_mask: Optional[Tensor] = None,
+                text_pos: Optional[Tensor] = None,
+                attend_text: bool = True,
                 is_first=False):
 
         # ========== Begin of Self-Attention =============
@@ -753,7 +837,30 @@ class TransformerDecoderLayer(nn.Module):
             tgt = tgt + self.dropout1(tgt2)
             tgt = self.norm1(tgt)
 
-        # ========== Begin of Cross-Attention =============
+        # ========== Begin of Text Cross-Attention ==========
+        # Each learnable span first reads the word-level query. The resulting
+        # text-conditioned span then enters the existing video cross-attention.
+        if attend_text and text_memory is not None:
+            text_query = tgt
+            text_key = text_memory if text_pos is None else text_memory + text_pos
+            text_value = text_memory
+
+            text_context, text_attn_weights = self.text_cross_attn(
+                query=text_query,
+                key=text_key,
+                value=text_value,
+                key_padding_mask=text_key_padding_mask,
+                need_weights=True,
+                average_attn_weights=True,
+            )
+            tgt = tgt + self.text_attn_dropout(text_context)
+            tgt = self.text_attn_norm(tgt)
+            self.last_text_attn_weights = text_attn_weights.detach()
+        else:
+            self.last_text_attn_weights = None
+        # ========== End of Text Cross-Attention ============
+
+        # ========== Begin of Video Cross-Attention =========
         # Apply projections here
         # shape: num_queries x batch_size x 256
         q_content = self.ca_qcontent_proj(tgt)
@@ -787,7 +894,7 @@ class TransformerDecoderLayer(nn.Module):
                                key=k,
                                value=v, attn_mask=memory_mask,
                                key_padding_mask=memory_key_padding_mask)[0]
-        # ========== End of Cross-Attention =============
+        # ========== End of Video Cross-Attention ===========
 
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
@@ -799,6 +906,7 @@ class TransformerDecoderLayer(nn.Module):
 
 class TransformerDecoderLayerThin(nn.Module):
     """removed intermediate layer"""
+
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False):
         super().__init__()
@@ -884,7 +992,6 @@ class TransformerDecoderLayerThin(nn.Module):
                                     tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
                                  tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
-
 
 
 def _get_clones(module, N):

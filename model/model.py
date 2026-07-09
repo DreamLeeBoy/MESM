@@ -17,23 +17,23 @@ class MESM(nn.Module):
     """ This is the Moment-DETR module that performs moment localization. """
 
     def __init__(
-        self, text_encoder, enhance_encoder, t2v_encoder, transformer, 
-        vid_position_embed, txt_position_embed, txt_dim, vid_dim,
-        num_queries, input_dropout, 
-        aux_loss=False, max_video_l=75, max_words_l=32, 
-        normalize_txt=True, use_txt_pos=False,
-        span_loss_type="l1", n_input_proj=2,
-        rec_fw=False, vocab_size=1111,
-        rec_ss=False, num_recss_layers=2,
+            self, text_encoder, enhance_encoder, t2v_encoder, transformer,
+            vid_position_embed, txt_position_embed, txt_dim, vid_dim,
+            num_queries, input_dropout,
+            aux_loss=False, max_video_l=75, max_words_l=32,
+            normalize_txt=True, use_txt_pos=False,
+            span_loss_type="l1", n_input_proj=2,
+            rec_fw=False, vocab_size=1111,
+            rec_ss=False, num_recss_layers=2,
     ):
         super().__init__()
         self.text_encoder = text_encoder
         if self.text_encoder is not None:
             for param in self.text_encoder.parameters():
                 param.requires_grad_(False)
-        self.enhance_encoder = enhance_encoder      # FW-MESM
-        self.t2v_encoder = t2v_encoder              # Aligner
-        self.transformer = transformer              # DETR
+        self.enhance_encoder = enhance_encoder  # FW-MESM
+        self.t2v_encoder = t2v_encoder  # Aligner
+        self.transformer = transformer  # DETR
         self.vid_position_embed = vid_position_embed
         self.txt_position_embed = txt_position_embed
         self.num_queries = num_queries
@@ -49,7 +49,7 @@ class MESM(nn.Module):
         self.n_input_proj = n_input_proj
         self.query_embed = nn.Embedding(num_queries, 2)
         relu_args = [True] * 3
-        relu_args[n_input_proj-1] = False
+        relu_args[n_input_proj - 1] = False
         self.input_txt_proj = nn.Sequential(*[
             LinearLayer(txt_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
@@ -66,6 +66,12 @@ class MESM(nn.Module):
         self.aux_loss = aux_loss
 
         self.hidden_dim = hidden_dim
+
+        # Learnable semantic content for the 10 span queries.
+        # self.query_embed keeps the 2-D temporal reference points (center, width),
+        # while this embedding carries semantic information inside the decoder.
+        self.query_content_embed = nn.Embedding(num_queries, hidden_dim)
+
         self.global_rep_token = nn.Parameter(torch.randn(hidden_dim))
         self.global_rep_pos = nn.Parameter(torch.randn(hidden_dim))
 
@@ -77,7 +83,7 @@ class MESM(nn.Module):
             num_classes = vocab_size + 1
         else:
             raise NotImplementedError
-        
+
         # frame-word level reconstruction (FW-MESM)
         if rec_fw:
             self.masked_token = nn.Parameter(torch.zeros(txt_dim).float(), requires_grad=True)
@@ -86,11 +92,11 @@ class MESM(nn.Module):
                 LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=True),
                 nn.Linear(hidden_dim, num_classes),
             ])
-        
+
         # segment-sentence level reconstruction (SS-MESM)
         self.rec_ss = rec_ss
         if rec_ss:
-            self.ss_reconstructor = SegSenRecon(    # SS-MESM
+            self.ss_reconstructor = SegSenRecon(  # SS-MESM
                 input_dropout=input_dropout, hidden_dim=hidden_dim, nhead=transformer.nhead,
                 num_layers=num_recss_layers, dim_feedforward=transformer.dim_feedforward,
                 dropout=transformer.dropout, activation=transformer.activation,
@@ -99,7 +105,7 @@ class MESM(nn.Module):
             ## ablation 1
             # self.mix_txt_proj = LinearLayer(hidden_dim*2, hidden_dim, layer_norm=True, dropout=0, relu=False)
             # self.mix_txt_proj = nn.Linear(hidden_dim*2, hidden_dim)
-        
+
     def CLIP_encode_text(self, words_id, words_mask, device):
         if device == torch.device(type='cpu'):
             self.text_encoder.to("cuda")
@@ -110,12 +116,11 @@ class MESM(nn.Module):
         if device == torch.device(type='cpu'):
             words_id = words_id.to("cpu")
             words_feat = words_feat.to("cpu")
-            
 
         words_feat = words_feat[:, :self.max_words_l, :]
         words_id = words_id[:, :self.max_words_l]
         words_mask = words_mask[:, :self.max_words_l]
-        words_feat.masked_fill_(words_mask.unsqueeze(-1)==False, 0)
+        words_feat.masked_fill_(words_mask.unsqueeze(-1) == False, 0)
         # ## ablation 1
         # sentence_feat = txt_feat["pooler_output"].to(torch.float32)
 
@@ -126,16 +131,16 @@ class MESM(nn.Module):
         # sentence_feat = words_feat.max(dim=1)[0]
         if device == torch.device(type='cpu'):
             sentence_feat = sentence_feat.to("cpu")
-        
+
         if self.normalize_txt:
             words_feat = F.normalize(words_feat, dim=-1, p=2, eps=1e-5)
             sentence_feat = F.normalize(sentence_feat, dim=-1, p=2, eps=1e-5)
-        
+
         return words_feat, sentence_feat, words_id, words_mask
-    
+
     def GloVe_encode_text(self, words_id, words_mask):
         words_feat = self.text_encoder(words_id)
-        words_feat.masked_fill_(words_mask.unsqueeze(-1)==False, 0)
+        words_feat.masked_fill_(words_mask.unsqueeze(-1) == False, 0)
         sentence_feat = words_feat.sum(dim=1) / words_mask.sum(dim=1).unsqueeze(-1)
         if self.normalize_txt:
             words_feat = F.normalize(words_feat, dim=-1, p=2, eps=1e-5)
@@ -165,16 +170,16 @@ class MESM(nn.Module):
         batch_size = video_feat.shape[0]
         projed_video_feat = self.input_vid_proj(video_feat)
         projed_words_feat = self.input_txt_proj(words_feat)
+
         vid_position = self.vid_position_embed(projed_video_feat, video_mask)  # (bsz, L_vid, d)
         if self.use_txt_pos:
             txt_position = self.txt_position_embed(projed_words_feat)
         else:
             txt_position = torch.zeros_like(projed_words_feat)
 
-
         if self.rec_fw:
             enhanced_video_feat = self.enhance_encoder(
-                projed_words_feat, projed_video_feat, 
+                projed_words_feat, projed_video_feat,
                 src_txt_key_padding_mask=~words_mask, pos_txt=txt_position,
                 src_vid_key_padding_mask=~video_mask, pos_vid=vid_position
             )
@@ -195,7 +200,7 @@ class MESM(nn.Module):
                 batched_vid_position = self.vid_position_embed(batched_vid, batched_vid_mask)
             else:
                 raise NotImplementedError
-            
+
             batched_sent, batched_sent_mask = split_expand_and_pad(num_clips, num_clips, sentence_feat)
 
             batched_vid = self.input_vid_proj(batched_vid)
@@ -228,7 +233,7 @@ class MESM(nn.Module):
             expanded_txt_position = torch.zeros_like(expanded_words_feat)
 
         encoded_video_feat = self.t2v_encoder(
-            expanded_words_feat, enhanced_video_feat, 
+            expanded_words_feat, enhanced_video_feat,
             src_txt_key_padding_mask=~expanded_words_mask, pos_txt=expanded_txt_position,
             src_vid_key_padding_mask=~video_mask, pos_vid=vid_position
         )
@@ -237,10 +242,19 @@ class MESM(nn.Module):
         global_token = self.global_rep_token.reshape([1, 1, self.hidden_dim]).repeat(batch_size, 1, 1)
         global_token_pos = self.global_rep_pos.reshape([1, 1, self.hidden_dim]).repeat(batch_size, 1, 1)
 
+        # Decoder order:
+        # learnable span content -> text cross-attention -> enhanced-video cross-attention.
         hs, reference, memory, memory_global = self.transformer(
-            encoded_video_feat, ~video_mask, 
-            self.query_embed.weight, vid_position, 
-            global_token, global_token_pos
+            src=encoded_video_feat,
+            mask=~video_mask,
+            query_embed=self.query_embed.weight,
+            query_content_embed=self.query_content_embed.weight,
+            pos_embed=vid_position,
+            global_token=global_token,
+            global_token_pos=global_token_pos,
+            text_memory=projed_words_feat,
+            text_key_padding_mask=~words_mask,
+            text_pos=txt_position,
         )
 
         outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, #classes)
@@ -250,7 +264,7 @@ class MESM(nn.Module):
         # outputs_coord = tmp
         if self.span_loss_type == "l1":
             outputs_coord = outputs_coord.sigmoid()
-        
+
         # if kwargs["dataset_name"] in ["tacos"]:
         #     neg_index = sample_inclass_neg(num_clips, kwargs['norm_moment'])
         # else:
@@ -274,32 +288,42 @@ class MESM(nn.Module):
 
         # # final ablation for FWSM, self.rec_fw should set to False
         # neg_enhanced_video_feat = self.enhance_encoder(
-        #     neg_words_feat, projed_video_feat, 
+        #     neg_words_feat, projed_video_feat,
         #     src_txt_key_padding_mask=~neg_words_mask, pos_txt=neg_txt_position,
         #     src_vid_key_padding_mask=~video_mask, pos_vid=neg_vid_position
         # )
         if self.rec_fw:
             neg_enhanced_video_feat = self.enhance_encoder(
-                neg_words_feat, projed_video_feat, 
+                neg_words_feat, projed_video_feat,
                 src_txt_key_padding_mask=~neg_words_mask, pos_txt=neg_txt_position,
                 src_vid_key_padding_mask=~video_mask, pos_vid=neg_vid_position
             )
         else:
             neg_enhanced_video_feat = projed_video_feat
-        
+
         neg_encoded_video_feat = self.t2v_encoder(
-            neg_expanded_words_feat, neg_enhanced_video_feat, 
+            neg_expanded_words_feat, neg_enhanced_video_feat,
             src_txt_key_padding_mask=~neg_expanded_words_mask, pos_txt=neg_expanded_txt_position,
             src_vid_key_padding_mask=~video_mask, pos_vid=neg_vid_position
         )
         _, _, neg_memory, neg_memory_global = self.transformer(
-            neg_encoded_video_feat, ~video_mask,
-            self.query_embed.weight, neg_vid_position,
-            global_token, global_token_pos
+            src=neg_encoded_video_feat,
+            mask=~video_mask,
+            query_embed=self.query_embed.weight,
+            query_content_embed=self.query_content_embed.weight,
+            pos_embed=neg_vid_position,
+            global_token=global_token,
+            global_token_pos=global_token_pos,
+            text_memory=neg_words_feat,
+            text_key_padding_mask=~neg_words_mask,
+            text_pos=neg_txt_position,
         )
 
-        saliency_scores = torch.sum(self.saliency_proj1(memory) * self.saliency_proj2(memory_global).unsqueeze(1), dim=-1) / np.sqrt(self.hidden_dim)
-        neg_saliency_scores = torch.sum(self.saliency_proj1(neg_memory) * self.saliency_proj2(neg_memory_global).unsqueeze(1), dim=-1) / np.sqrt(self.hidden_dim)
+        saliency_scores = torch.sum(self.saliency_proj1(memory) * self.saliency_proj2(memory_global).unsqueeze(1),
+                                    dim=-1) / np.sqrt(self.hidden_dim)
+        neg_saliency_scores = torch.sum(
+            self.saliency_proj1(neg_memory) * self.saliency_proj2(neg_memory_global).unsqueeze(1), dim=-1) / np.sqrt(
+            self.hidden_dim)
 
         if self.aux_loss:
             aux_outputs = [{'pred_logits': a, 'pred_spans': b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
@@ -312,7 +336,8 @@ class MESM(nn.Module):
             selected_length = clip_mask.sum(dim=1)
             merged_clip_feat, merged_clip_mask = split_and_pad(selected_length, selected_video_feat)
 
-            masked_words_feat, masked_words_loc = self._mask_words(unknowned_words_feat, words_mask, self.masked_token, proj=True, weight=words_weight)
+            masked_words_feat, masked_words_loc = self._mask_words(unknowned_words_feat, words_mask, self.masked_token,
+                                                                   proj=True, weight=words_weight)
             # if self.rec_ss:
             #     expanded_masked_words_feat = torch.cat([recon_feat.unsqueeze(1), masked_words_feat], dim=1)
             # else:
@@ -330,7 +355,7 @@ class MESM(nn.Module):
                 src_vid_key_padding_mask=~words_mask, pos_vid=txt_position, is_MLM=True
             )
             recfw_words_logit = self.output_txt_proj(recfw_out)
-        
+
         out = {
             "pred_logits": outputs_class[-1],
             "pred_spans": outputs_coord[-1],
@@ -373,16 +398,16 @@ class MESM(nn.Module):
                 continue
             num_masked_words = max(l // 3, 1)
             p = weight[i, :l].numpy() if weight is not None else None
-            
+
             choices = np.random.choice(np.arange(0, l), num_masked_words, replace=False, p=p)
             masked_words[i, choices] = 1
-        
+
         masked_words_vec = src_txt.new_zeros(*src_txt.size()) + masked_token
         masked_words_vec.masked_fill_(masked_words.unsqueeze(-1) == 0, 0)
         masked_src_txt = src_txt.masked_fill(masked_words.unsqueeze(-1) == 1, 0) + masked_words_vec
 
         return masked_src_txt, masked_words
-    
+
     def _replace_unknown(self, words_feat, unknown_mask, masked_token, proj=True):
         masked_token = masked_token.unsqueeze(0).unsqueeze(0)
         if proj:
@@ -497,8 +522,7 @@ class SegSenRecon(nn.Module):
             mask.append(sequence_mask)
         mask = torch.cat(mask)
         masked_vec = batched_sent.new_zeros(*batched_sent.size()) + masked_token
-        masked_vec.masked_fill_(mask.unsqueeze(-1)==False, 0)
+        masked_vec.masked_fill_(mask.unsqueeze(-1) == False, 0)
         masked_sent = batched_sent.masked_fill(mask.unsqueeze(-1), 0) + masked_vec
 
         return masked_sent, mask
-

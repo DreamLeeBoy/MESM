@@ -1,5 +1,5 @@
 {
-    "exp_id": "C+SF_C",
+    "exp_id": "C+SF_C_bg_rank_v3",
     "dataset_name": "charades",
     "ann_path": "./data/charades/annotations",
     "feat_files": [
