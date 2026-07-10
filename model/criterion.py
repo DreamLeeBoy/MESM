@@ -325,6 +325,7 @@ class Criterion(nn.Module):
             "saliency": self.loss_saliency,
             "rec_ss": self.loss_rec_ss,
             "rec_fw": self.loss_rec_fw,
+            "path_balance": self.loss_path_balance,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, **kwargs)
@@ -379,3 +380,7 @@ class Criterion(nn.Module):
 
         return losses, total_loss
 
+    def loss_path_balance(self, outputs, targets, indices, log=True):
+        if "path_balance_loss" not in outputs:
+            return {"loss_path_balance": torch.tensor(0.0, device=outputs["pred_logits"].device)}
+        return {"loss_path_balance": outputs["path_balance_loss"]}

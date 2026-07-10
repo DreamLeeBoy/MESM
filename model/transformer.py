@@ -16,7 +16,7 @@ from torch import nn, Tensor
 import math
 import numpy as np
 from .attention import MultiheadAttention
-
+from .pathformer_encoder import PathformerEncoder
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -127,6 +127,12 @@ class Transformer(nn.Module):
                  num_patterns=0,
                  modulate_t_attn=True,
                  bbox_embed_diff_each_layer=False,
+                 use_path_encoder=False,
+                 path_input_size=75,
+                 path_patch_sizes=(3, 5, 15),
+                 path_top_k=2,
+                 path_noisy_gating=True,
+                 path_balance_loss_coef=1e-2,
                  ):
         super().__init__()
 
@@ -165,7 +171,22 @@ class Transformer(nn.Module):
         self.activation = activation
         self.normalize_before = normalize_before
         self.num_decoder_layers = num_decoder_layers
+        self.use_path_encoder = use_path_encoder
+        self.path_balance_loss_coef = path_balance_loss_coef
 
+        if self.use_path_encoder:
+            self.path_encoder = PathformerEncoder(
+                input_size=path_input_size,
+                d_model=d_model,
+                d_ff=dim_feedforward,
+                patch_size=path_patch_sizes,
+                top_k=path_top_k,
+                noisy_gating=path_noisy_gating,
+                residual_connection=1,
+                batch_norm=False
+            )
+        else:
+            self.path_encoder = None
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
@@ -215,6 +236,18 @@ class Transformer(nn.Module):
         mask_local = mask[:, 1:]
         pos_embed_local = pos_embed[1:]
 
+        path_balance_loss = memory_local.new_zeros(())
+
+        # Pathformer module is inserted after Transformer Encoder and before Decoder.
+        # Keep the global token unchanged; only enhance local video memory.
+        if self.path_encoder is not None:
+            memory_local_bld = memory_local.transpose(0, 1)  # [B, L, D]
+            memory_local_bld, path_balance_loss = self.path_encoder(
+                memory_local_bld,
+                loss_coef=self.path_balance_loss_coef
+            )
+            memory_local = memory_local_bld.transpose(0, 1)  # [L, B, D]
+
         if query_content_embed is None:
             # Backward-compatible fallback: zero semantic content.
             tgt = torch.zeros(
@@ -258,7 +291,7 @@ class Transformer(nn.Module):
             text_pos=text_pos,
         )  # (#layers, #queries, batch_size, d)
         memory_local = memory_local.transpose(0, 1)  # (batch_size, L, d)
-        return hs, references, memory_local, memory_global
+        return hs, references, memory_local, memory_global, path_balance_loss
 
 
 class T2V_TransformerEncoder(nn.Module):

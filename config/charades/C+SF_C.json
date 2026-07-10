@@ -85,5 +85,10 @@
     "max_before_nms": 10,
     "max_after_nms": 10,
     "span_los_type": "l1",
-    "is_inference": false
+    "is_inference": false,
+    "use_path_encoder": true,
+    "path_patch_sizes": [3, 5, 15],
+    "path_top_k": 2,
+    "disable_path_noisy_gating": false,
+    "loss_path_balance_coef": 0.01
 }

@@ -70,6 +70,16 @@ class BaseOptions(object):
         parser.add_argument("--enc_layers", type=int, default=2)
         parser.add_argument("--dec_layers", type=int, default=2)
         parser.add_argument("--pre_norm", action="store_true")
+        parser.add_argument("--use_path_encoder", default=False, action="store_true",
+                            help="enable Pathformer AMS module after Transformer encoder and before decoder")
+        parser.add_argument("--path_patch_sizes", type=int, nargs="+", default=[3, 5, 15],
+                            help="temporal patch sizes for Pathformer AMS; each must divide max_video_l")
+        parser.add_argument("--path_top_k", type=int, default=2,
+                            help="number of selected temporal pathways in noisy Top-K gating")
+        parser.add_argument("--disable_path_noisy_gating", default=False, action="store_true",
+                            help="disable noisy gating in Pathformer AMS")
+        parser.add_argument("--loss_path_balance_coef", default=0.01, type=float,
+                            help="balance loss coefficient for Pathformer noisy Top-K routing")
         # Position Embedding
         parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
                             help="Type of positional embedding to use on top of the image features")

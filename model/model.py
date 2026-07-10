@@ -244,7 +244,7 @@ class MESM(nn.Module):
 
         # Decoder order:
         # learnable span content -> text cross-attention -> enhanced-video cross-attention.
-        hs, reference, memory, memory_global = self.transformer(
+        hs, reference, memory, memory_global, path_balance_loss = self.transformer(
             src=encoded_video_feat,
             mask=~video_mask,
             query_embed=self.query_embed.weight,
@@ -306,7 +306,7 @@ class MESM(nn.Module):
             src_txt_key_padding_mask=~neg_expanded_words_mask, pos_txt=neg_expanded_txt_position,
             src_vid_key_padding_mask=~video_mask, pos_vid=neg_vid_position
         )
-        _, _, neg_memory, neg_memory_global = self.transformer(
+        _, _, neg_memory, neg_memory_global, _ = self.transformer(
             src=neg_encoded_video_feat,
             mask=~video_mask,
             query_embed=self.query_embed.weight,
@@ -361,6 +361,7 @@ class MESM(nn.Module):
             "pred_spans": outputs_coord[-1],
             "saliency_scores": saliency_scores,
             "neg_saliency_scores": neg_saliency_scores,
+            "path_balance_loss" : path_balance_loss
         }
         if self.aux_loss:
             out.update({"aux_outputs": aux_outputs})

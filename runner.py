@@ -233,6 +233,12 @@ def build_transformer(args):
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,
         activation='prelu',
+        use_path_encoder=args.use_path_encoder,
+        path_input_size=args.max_video_l,
+        path_patch_sizes=args.path_patch_sizes,
+        path_top_k=args.path_top_k,
+        path_noisy_gating=not args.disable_path_noisy_gating,
+        path_balance_loss_coef=args.loss_path_balance_coef,
     )
 
 
@@ -315,6 +321,9 @@ def build_criterion(args):
                    "loss_label": args.loss_label_coef,
                    "loss_saliency": args.loss_saliency_coef,}
 
+    if args.use_path_encoder and args.loss_path_balance_coef > 0:
+        losses.append("path_balance")
+        weight_dict["loss_path_balance"] = 1.0
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
