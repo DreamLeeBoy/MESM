@@ -2,7 +2,7 @@
     "is_inference": true,
     "inference_id": "C+SF_C",
     "inference_result_dir": "./results/eval",
-    "trained_result_dir": "./results/charades/charades-C+SF_C-2026_07_08_19_03_30",
+    "trained_result_dir": "./results/charades/charades-C+SF_C_bg_rank_v3-2026_07_10_11_39_25",
 
     "num_workers": 8,
     "nms_thd": -1,

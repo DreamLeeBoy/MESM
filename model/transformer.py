@@ -794,26 +794,15 @@ class TransformerDecoderLayer(nn.Module):
             self.norm1 = nn.LayerNorm(d_model)
             self.dropout1 = nn.Dropout(dropout)
 
-        # Three-layer Learnable Span -> Text Cross-Modal Fusion.
-        # The learnable temporal span queries read the word-level sentence
-        # representation three consecutive times before video cross-attention.
-        # This deepens the span-text interaction without changing the external
-        # Transformer.forward API or the MESM model head.
-        self.num_text_fusion_layers = 3
-        self.text_cross_attn_layers = nn.ModuleList([
-            nn.MultiheadAttention(
-                embed_dim=d_model,
-                num_heads=nhead,
-                dropout=dropout,
-            )
-            for _ in range(self.num_text_fusion_layers)
-        ])
-        self.text_attn_norm_layers = nn.ModuleList([
-            nn.LayerNorm(d_model) for _ in range(self.num_text_fusion_layers)
-        ])
-        self.text_attn_dropout_layers = nn.ModuleList([
-            nn.Dropout(dropout) for _ in range(self.num_text_fusion_layers)
-        ])
+        # Learnable Span -> Text Cross-Attention.
+        # This runs after span self-attention and before video cross-attention.
+        self.text_cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+        )
+        self.text_attn_norm = nn.LayerNorm(d_model)
+        self.text_attn_dropout = nn.Dropout(dropout)
         self.last_text_attn_weights = None
 
         # Decoder Video Cross-Attention
@@ -882,39 +871,28 @@ class TransformerDecoderLayer(nn.Module):
             tgt = tgt + self.dropout1(tgt2)
             tgt = self.norm1(tgt)
 
-        # ========== Begin of Three-Layer Text Cross-Modal Fusion ==========
-        # Each learnable span query repeatedly attends to word-level features.
-        # Layer 1 gives coarse text grounding, layer 2 refines phrase-level
-        # evidence, and layer 3 produces the final text-conditioned span query
-        # used by the following video cross-attention.
+        # ========== Begin of Text Cross-Attention ==========
+        # Each learnable span first reads the word-level query. The resulting
+        # text-conditioned span then enters the existing video cross-attention.
         if attend_text and text_memory is not None:
+            text_query = tgt
             text_key = text_memory if text_pos is None else text_memory + text_pos
             text_value = text_memory
-            last_text_attn_weights = None
 
-            for text_cross_attn, text_attn_dropout, text_attn_norm in zip(
-                self.text_cross_attn_layers,
-                self.text_attn_dropout_layers,
-                self.text_attn_norm_layers,
-            ):
-                text_context, text_attn_weights = text_cross_attn(
-                    query=tgt,
-                    key=text_key,
-                    value=text_value,
-                    key_padding_mask=text_key_padding_mask,
-                    need_weights=True,
-                    average_attn_weights=True,
-                )
-                tgt = tgt + text_attn_dropout(text_context)
-                tgt = text_attn_norm(tgt)
-                last_text_attn_weights = text_attn_weights
-
-            self.last_text_attn_weights = (
-                last_text_attn_weights.detach() if last_text_attn_weights is not None else None
+            text_context, text_attn_weights = self.text_cross_attn(
+                query=text_query,
+                key=text_key,
+                value=text_value,
+                key_padding_mask=text_key_padding_mask,
+                need_weights=True,
+                average_attn_weights=True,
             )
+            tgt = tgt + self.text_attn_dropout(text_context)
+            tgt = self.text_attn_norm(tgt)
+            self.last_text_attn_weights = text_attn_weights.detach()
         else:
             self.last_text_attn_weights = None
-        # ========== End of Three-Layer Text Cross-Modal Fusion ============
+        # ========== End of Text Cross-Attention ============
 
         # ========== Begin of Video Cross-Attention =========
         # Apply projections here
