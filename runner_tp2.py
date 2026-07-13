@@ -8,11 +8,8 @@ from __future__ import annotations
 import logging
 
 import runner as mesm_runner
-from model.tp2_modules import (
-    DeformableTransformer1D,
-    MESMTP2,
-    TP2Criterion,
-)
+from model.deformable_transformer_1d import DeformableTransformer1D
+from model.tp2_model import MESMTP2, TP2Criterion
 
 logger = logging.getLogger(__name__)
 
