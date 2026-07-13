@@ -1,6 +1,7 @@
 import torch
 
-from model.tp2_modules import DeformableTransformer1D, TemporalFeaturePyramid
+from model.deformable_transformer_1d import DeformableTransformer1D
+from model.tp2_fpn import TemporalFeaturePyramid
 
 
 def test_temporal_feature_pyramid_shapes():
