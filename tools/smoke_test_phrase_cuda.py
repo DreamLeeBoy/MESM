@@ -10,8 +10,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+# Running ``python tools/smoke_test_phrase_cuda.py`` puts ``tools/`` rather
+# than the repository root on sys.path. Add the project root explicitly before
+# importing local packages so the command works from any current directory.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 
@@ -22,7 +30,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config",
-        default="./config/charades/C+SF_C_phrase_steering_v1_2.json",
+        default=str(REPO_ROOT / "config/charades/C+SF_C_phrase_steering_v1_2.json"),
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=2019)
@@ -44,9 +52,28 @@ def main():
     from dataset import prepare_batch_input
     from phrase_steering.dataset import phrase_collate
 
-    config_path = Path(args.config)
+    config_path = Path(args.config).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
+
+    # Resolve repository-relative paths independently of the caller's cwd.
+    for key in ["ann_path", "bpe_path", "text_model_path"]:
+        if key in config and config[key] is not None:
+            value = Path(config[key]).expanduser()
+            if not value.is_absolute():
+                value = REPO_ROOT / value
+            config[key] = str(value.resolve())
+    if "semantic_sidecar_dir" in config and config["semantic_sidecar_dir"] is not None:
+        value = Path(config["semantic_sidecar_dir"]).expanduser()
+        if not value.is_absolute():
+            value = REPO_ROOT / value
+        config["semantic_sidecar_dir"] = str(value.resolve())
+    config["feat_files"] = [
+        str((REPO_ROOT / Path(value)).resolve())
+        if not Path(value).expanduser().is_absolute()
+        else str(Path(value).expanduser().resolve())
+        for value in config["feat_files"]
+    ]
 
     config.update({
         "num_workers": 0,
