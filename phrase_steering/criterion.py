@@ -101,6 +101,11 @@ class PhraseCriterion(Criterion):
                 self.get_loss(loss_name, outputs, targets, indices)
             )
 
+        if "phrase_valid" in outputs:
+            losses["phrase_valid_rate"] = outputs["phrase_valid"].float().mean().detach()
+        if "phrase_steering_scale" in outputs:
+            losses["phrase_steering_scale"] = outputs["phrase_steering_scale"].detach()
+
         if "aux_outputs" in outputs:
             for layer_index, auxiliary_outputs in enumerate(outputs["aux_outputs"]):
                 auxiliary_indices = self.matcher(auxiliary_outputs, targets)
