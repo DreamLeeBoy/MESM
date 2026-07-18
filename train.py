@@ -16,7 +16,8 @@ from utils import BaseOptions
 from runner import build_vocab, build_vocab_from_pkl
 from runner import build_dataloader, build_model
 from runner import build_criterion, build_optimizer
-from dataset import prepare_batch_input
+from dataset import prepare_batch_input, configure_phrase_contrastive_dataset
+from model import configure_phrase_contrastive
 from utils import AverageMeter
 from utils import dict_to_markdown, count_parameters
 from utils import state_dict_without_module
@@ -44,7 +45,6 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
     model.train()
     criterion.train()
 
-    # init meters
     time_meters = defaultdict(AverageMeter)
     loss_meters = defaultdict(AverageMeter)
 
@@ -56,7 +56,6 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
         time_meters["dataloading_time"].update(time.time() - timer_dataloading)
 
         timer_start = time.time()
-
         prepare_batch_input(batch, opt.device, non_blocking=opt.pin_memory)
         time_meters["prepare_inputs_time"].update(time.time() - timer_start)
         timer_start = time.time()
@@ -72,13 +71,12 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
         optimizer.step()
         time_meters["model_backward_time"].update(time.time() - timer_start)
 
-        loss_dict["loss_overall"] = float(loss)  # for logging only
+        loss_dict["loss_overall"] = float(loss)
         for k, v in loss_dict.items():
             loss_meters[k].update(float(v) * criterion.weight_dict[k] if k in criterion.weight_dict else float(v))
 
         timer_dataloading = time.time()
-        
-    # print/add logs
+
     tb_writer.add_scalar("Train/lr", float(optimizer.param_groups[0]["lr"]), epoch_i+1)
     for k, v in loss_meters.items():
         tb_writer.add_scalar("Train/{}".format(k), v.avg, epoch_i+1)
@@ -98,6 +96,8 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
 
 def train():
     opt = BaseOptions().parse()
+    configure_phrase_contrastive(opt)
+    configure_phrase_contrastive_dataset(opt)
     set_seed(opt.seed)
 
     if opt.tokenizer_type == "GloVeSimple":
@@ -125,7 +125,7 @@ def train():
         logger.info(f"Loaded model saved at epoch {checkpoint['epoch']} from checkpoint: {opt.resume}")
     else:
         logger.warning("If you intend to evaluate the model, please specify --resume with ckpt path")
-    
+
     logger.info(f"Model {model}")
     count_parameters(model)
     logger.info("Start training...")
@@ -134,20 +134,19 @@ def train():
     tb_writer.add_text("hyperparameters", dict_to_markdown(vars(opt), max_str_len=None))
     opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"
     opt.eval_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Split] {split} [Loss] {loss_str} [Metrics] {eval_metrics_str}\n"
-    
+
     prev_best_score_dict = {key: 0. for key in val_loaders.keys()}
     es_cnt = 0
-    # start_epoch = 0
     if opt.start_epoch is None:
         start_epoch = -1 if opt.eval_untrained else 0
     else:
         start_epoch = opt.start_epoch
-    
+
     for epoch_i in trange(start_epoch, opt.n_epoch, desc="Epoch"):
         if epoch_i > -1:
             train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writer)
             lr_scheduler.step()
-        
+
         if (epoch_i + 1) % opt.eval_epoch_interval == 0:
             for key, val_loader in val_loaders.items():
                 logger.info(f"Evaluating {key} split")
@@ -155,8 +154,7 @@ def train():
                 with torch.no_grad():
                     metrics_no_nms, metrics_nms, eval_loss_meters, latest_file_paths = \
                         eval_epoch(model, val_loader, opt, save_submission_filename, epoch_i, criterion, tb_writer)
-                
-                # log
+
                 to_write = opt.eval_log_txt_formatter.format(
                     time_str=time.strftime("%Y_%m_%d_%H_%M_%S"),
                     epoch=epoch_i,
@@ -197,13 +195,12 @@ def train():
                     logger.info("The checkpoint file has been updated.")
                 else:
                     es_cnt += 1
-                    if opt.max_es_cnt != -1 and es_cnt > opt.max_es_cnt:  # early stop
+                    if opt.max_es_cnt != -1 and es_cnt > opt.max_es_cnt:
                         with open(opt.train_log_filepath, "a") as f:
                             f.write(f"Early Stop at epoch {epoch_i}")
                         logger.info(f"\n>>>>> Early stop at epoch {epoch_i}  {prev_best_score_dict[key]}\n")
                         break
 
-                # save ckpt
                 checkpoint = {
                     "model": state_dict_without_module(model, "text_encoder"),
                     "optimizer": optimizer.state_dict(),
@@ -213,7 +210,7 @@ def train():
                 }
                 torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", "_latest.ckpt"))
 
-        if (epoch_i + 1) % opt.save_interval == 0 or (epoch_i + 1) % opt.lr_drop == 0:  # additional copies
+        if (epoch_i + 1) % opt.save_interval == 0 or (epoch_i + 1) % opt.lr_drop == 0:
             checkpoint = {
                 "model": state_dict_without_module(model, "text_encoder"),
                 "optimizer": optimizer.state_dict(),
