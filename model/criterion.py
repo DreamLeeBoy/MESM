@@ -318,6 +318,142 @@ class Criterion(nn.Module):
 
         return nll_loss.contiguous(), mean_acc
 
+    def loss_qtp_phase(self, outputs, targets, indices=None, log=True):
+        """Query-relative Before / Inside / After supervision.
+
+        Ground-truth moment is normalized [start, end].  For a video with N
+        valid tokens, token centers are:
+            (0.5/N), (1.5/N), ..., ((N-0.5)/N)
+
+        Phase target:
+            center < start      -> 0 (before)
+            start <= center <= end -> 1 (inside)
+            center > end        -> 2 (after)
+
+        We use a per-video phase-balanced CE: each phase present in the sample
+        contributes equally.  This prevents short moments from being dominated
+        by the much larger Before/After regions.
+        """
+        if "qtp_phase_logits" not in outputs:
+            return {}
+
+        logits = outputs["qtp_phase_logits"]  # [B,L,3]
+        video_mask = targets["video_mask"].bool()
+
+        if logits.dim() != 3 or logits.size(-1) != 3:
+            raise ValueError(
+                f"qtp_phase_logits must be [B,L,3], got {tuple(logits.shape)}"
+            )
+        if video_mask.shape != logits.shape[:2]:
+            raise ValueError(
+                "video_mask/qtp logits shape mismatch: "
+                f"{tuple(video_mask.shape)} vs {tuple(logits.shape[:2])}"
+            )
+
+        gt_moment = targets["norm_moment"]
+        if not torch.is_tensor(gt_moment):
+            raise ValueError(
+                "QTP V1 expects a single normalized target moment per sample."
+            )
+        if gt_moment.dim() != 2 or gt_moment.size(-1) != 2:
+            raise ValueError(
+                "QTP V1 expects targets['norm_moment'] with shape [B,2], "
+                f"got {tuple(gt_moment.shape)}"
+            )
+
+        gt_moment = gt_moment.to(
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        video_mask = video_mask.to(logits.device)
+
+        bsz, seq_len, _ = logits.shape
+        valid_len = video_mask.sum(dim=1).clamp(min=1).to(logits.dtype)
+
+        token_idx = torch.arange(
+            seq_len,
+            device=logits.device,
+            dtype=logits.dtype,
+        ).unsqueeze(0)
+
+        # Normalized center of every valid video token, using each sample's
+        # actual valid length rather than padded sequence length.
+        token_center = (
+            token_idx + 0.5
+        ) / valid_len.unsqueeze(1)
+
+        start = gt_moment[:, 0].unsqueeze(1)
+        end = gt_moment[:, 1].unsqueeze(1)
+
+        labels = torch.ones(
+            (bsz, seq_len),
+            dtype=torch.long,
+            device=logits.device,
+        )
+        labels[token_center < start] = 0
+        labels[token_center > end] = 2
+        labels[~video_mask] = -100
+
+        token_loss = F.cross_entropy(
+            logits.transpose(1, 2),
+            labels,
+            ignore_index=-100,
+            reduction="none",
+        )  # [B,L]
+
+        # Per-sample, per-phase balancing.
+        sample_losses = []
+        for b in range(bsz):
+            phase_losses = []
+            for phase_id in (0, 1, 2):
+                phase_mask = labels[b] == phase_id
+                if phase_mask.any():
+                    phase_losses.append(token_loss[b][phase_mask].mean())
+            if phase_losses:
+                sample_losses.append(torch.stack(phase_losses).mean())
+
+        if sample_losses:
+            loss = torch.stack(sample_losses).mean()
+        else:
+            loss = logits.sum() * 0.0
+
+        # Diagnostics only; these are not included in weight_dict.
+        with torch.no_grad():
+            pred = logits.argmax(dim=-1)
+            valid = labels >= 0
+            if valid.any():
+                acc = (pred[valid] == labels[valid]).float().mean()
+            else:
+                acc = logits.new_tensor(0.0)
+
+            phase_accs = []
+            for phase_id in (0, 1, 2):
+                phase_mask = labels == phase_id
+                if phase_mask.any():
+                    phase_accs.append(
+                        (pred[phase_mask] == labels[phase_mask]).float().mean()
+                    )
+
+            if phase_accs:
+                balanced_acc = torch.stack(phase_accs).mean()
+            else:
+                balanced_acc = logits.new_tensor(0.0)
+
+            inside_mask = labels == 1
+            if inside_mask.any():
+                inside_acc = (
+                    pred[inside_mask] == labels[inside_mask]
+                ).float().mean()
+            else:
+                inside_acc = logits.new_tensor(0.0)
+
+        return {
+            "loss_qtp_phase": loss,
+            "qtp_phase_acc": acc,
+            "qtp_phase_bal_acc": balanced_acc,
+            "qtp_inside_acc": inside_acc,
+        }
+
     def get_loss(self, loss, outputs, targets, indices, **kwargs):
         loss_map = {
             "span": self.loss_spans,
@@ -326,6 +462,7 @@ class Criterion(nn.Module):
             "rec_ss": self.loss_rec_ss,
             "rec_fw": self.loss_rec_fw,
             "path_balance": self.loss_path_balance,
+            "qtp_phase": self.loss_qtp_phase,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, **kwargs)
@@ -369,7 +506,7 @@ class Criterion(nn.Module):
                 #     indices = None
                 #     losses_target = ["saliency"]    
                 for loss in losses_target:
-                    if loss in ["saliency", "bg_rank", "rec_ss", "rec_fw"]:
+                    if loss in ["saliency", "bg_rank", "rec_ss", "rec_fw", "qtp_phase"]:
                         continue
                     kwargs = {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, **kwargs)

@@ -260,6 +260,12 @@ def build_position_encoding(args):
 
 def build_model(args, vocab=None):
     logger.info("Building model...")
+
+    # QRTM V1 defaults.  getattr keeps this patch compatible with the current
+    # BaseOptions even if the new fields have not yet been added there.
+    use_qtp = getattr(args, "use_qtp", True)
+    qtp_hidden_dim = getattr(args, "qtp_hidden_dim", args.hidden_dim)
+    qtp_dropout = getattr(args, "qtp_dropout", 0.1)
     if args.tokenizer_type == "GloVeSimple":
         text_encoder = build_GloVe_text_encoder(args.text_model_path, vocab)
     elif args.tokenizer_type == "CLIP":
@@ -299,6 +305,9 @@ def build_model(args, vocab=None):
             vocab_size=args.vocab_size,
             rec_ss=args.rec_ss,
             num_recss_layers=args.num_recss_layers,
+            use_qtp=use_qtp,
+            qtp_hidden_dim=qtp_hidden_dim,
+            qtp_dropout=qtp_dropout,
     )
     model.to(args.device)
     return model
@@ -337,6 +346,13 @@ def build_criterion(args):
     if args.rec_ss:
         losses.append("rec_ss")
         weight_dict["loss_rec_ss"] = args.loss_recss_coef
+
+    use_qtp = getattr(args, "use_qtp", True)
+    if use_qtp and args.dataset_name != "qvhighlights":
+        losses.append("qtp_phase")
+        weight_dict["loss_qtp_phase"] = getattr(
+            args, "loss_qtp_phase_coef", 0.05
+        )
 
     criterion = Criterion(
         matcher=matcher, weight_dict=weight_dict, losses=losses,

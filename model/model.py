@@ -25,6 +25,8 @@ class MESM(nn.Module):
             span_loss_type="l1", n_input_proj=2,
             rec_fw=False, vocab_size=1111,
             rec_ss=False, num_recss_layers=2,
+            # Query-Relative Temporal Modeling (QRTM).
+            use_qtp=True, qtp_hidden_dim=256, qtp_dropout=0.1,
     ):
         super().__init__()
         self.text_encoder = text_encoder
@@ -66,6 +68,22 @@ class MESM(nn.Module):
         self.aux_loss = aux_loss
 
         self.hidden_dim = hidden_dim
+
+        # ---------------------------------------------------------------
+        # Query-Relative Temporal Phase (QTP)
+        # ---------------------------------------------------------------
+        # Keep the original TEF and sine positional encoding unchanged.
+        # QTP is attached only to the post-Pathformer local memory and predicts
+        # each valid video token's phase relative to the CURRENT text query:
+        #   0 = before target moment
+        #   1 = inside target moment
+        #   2 = after target moment
+        self.use_qtp = bool(use_qtp)
+        self.qtp_head = QueryRelativeTemporalHead(
+            hidden_dim=hidden_dim,
+            fusion_dim=qtp_hidden_dim,
+            dropout=qtp_dropout,
+        ) if self.use_qtp else None
 
         # Learnable semantic content for the 10 span queries.
         # self.query_embed keeps the 2-D temporal reference points (center, width),
@@ -257,6 +275,28 @@ class MESM(nn.Module):
             text_pos=txt_position,
         )
 
+        # ---------------------------------------------------------------
+        # Query-Relative Temporal Modeling
+        # ---------------------------------------------------------------
+        # `memory` is the local video memory AFTER the optional Pathformer:
+        # [B, L_video, D].
+        #
+        # Build one explicit query representation from the projected word
+        # features.  We intentionally use the real text tokens (not the SS
+        # reconstruction prefix), so the auxiliary task is conditioned on the
+        # user's query semantics.
+        qtp_phase_logits = None
+        if self.use_qtp:
+            q_mask = words_mask.unsqueeze(-1).to(projed_words_feat.dtype)
+            query_feat = (projed_words_feat * q_mask).sum(dim=1)
+            query_feat = query_feat / q_mask.sum(dim=1).clamp(min=1.0)
+
+            qtp_phase_logits = self.qtp_head(
+                memory,
+                query_feat,
+                video_mask,
+            )  # [B, L_video, 3]
+
         outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, #classes)
         reference_before_sigmoid = inverse_sigmoid(reference)
         tmp = self.span_embed(hs)
@@ -363,6 +403,10 @@ class MESM(nn.Module):
             "neg_saliency_scores": neg_saliency_scores,
             "path_balance_loss" : path_balance_loss
         }
+        if self.use_qtp:
+            out.update({
+                "qtp_phase_logits": qtp_phase_logits,
+            })
         if self.aux_loss:
             out.update({"aux_outputs": aux_outputs})
         if self.rec_ss:
@@ -418,6 +462,76 @@ class MESM(nn.Module):
         masked_words_vec.masked_fill_(unknown_mask.unsqueeze(-1) == 0, 0)
         replaced_words_feat = words_feat.masked_fill(unknown_mask.unsqueeze(-1) == 1, 0) + masked_words_vec
         return replaced_words_feat
+
+
+
+class QueryRelativeTemporalHead(nn.Module):
+    """Predict query-relative temporal phase for each post-Pathformer token.
+
+    Inputs:
+        video_memory: [B, L, D] post-Pathformer local memory
+        query_feat:   [B, D]    pooled projected text query
+        video_mask:   [B, L]    True for valid video tokens
+
+    Output:
+        logits:       [B, L, 3]
+                      class 0 = before
+                      class 1 = inside
+                      class 2 = after
+
+    The head receives no ground-truth boundary coordinates.  Therefore absolute
+    position alone cannot solve the task: the same video position may be
+    before/inside/after for different text queries.
+    """
+
+    def __init__(self, hidden_dim=256, fusion_dim=256, dropout=0.1):
+        super().__init__()
+        self.video_norm = nn.LayerNorm(hidden_dim)
+        self.query_norm = nn.LayerNorm(hidden_dim)
+
+        # Explicit video-query interaction:
+        # [v, q, v*q, v-q] -> 3 temporal phases.
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 4, fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim, 3),
+        )
+
+    def forward(self, video_memory, query_feat, video_mask=None):
+        if video_memory.dim() != 3:
+            raise ValueError(
+                f"video_memory must be [B,L,D], got {tuple(video_memory.shape)}"
+            )
+        if query_feat.dim() != 2:
+            raise ValueError(
+                f"query_feat must be [B,D], got {tuple(query_feat.shape)}"
+            )
+        if video_memory.shape[0] != query_feat.shape[0]:
+            raise ValueError("video/query batch size mismatch")
+        if video_memory.shape[2] != query_feat.shape[1]:
+            raise ValueError("video/query hidden dimension mismatch")
+
+        v = self.video_norm(video_memory)
+        q = self.query_norm(query_feat).unsqueeze(1).expand(
+            -1, video_memory.size(1), -1
+        )
+
+        fused = torch.cat(
+            [v, q, v * q, v - q],
+            dim=-1,
+        )
+        logits = self.fusion(fused)
+
+        # Padding tokens are ignored by the criterion.  Zeroing them here keeps
+        # diagnostic tensors clean without affecting valid-token gradients.
+        if video_mask is not None:
+            logits = logits.masked_fill(
+                ~video_mask.bool().unsqueeze(-1),
+                0.0,
+            )
+
+        return logits
 
 
 class MLP(nn.Module):
