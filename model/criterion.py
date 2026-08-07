@@ -22,7 +22,8 @@ class Criterion(nn.Module):
                  bg_rank_margin=0.2,
                  bg_iou_threshold=0.1,
                  bg_candidate_centers=39,
-                 bg_candidate_widths=(0.05, 0.10, 0.15, 0.20, 0.30)):
+                 bg_candidate_widths=(0.05, 0.10, 0.15, 0.20, 0.30),
+                 fw_evidence_quality_temperature=0.25):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -68,7 +69,13 @@ class Criterion(nn.Module):
         self.bg_iou_threshold = bg_iou_threshold
         self.bg_candidate_centers = bg_candidate_centers
         self.bg_candidate_widths = tuple(bg_candidate_widths)
-    
+
+        self.fw_evidence_quality_temperature = float(
+            fw_evidence_quality_temperature
+        )
+        if self.fw_evidence_quality_temperature <= 0:
+            raise ValueError("fw_evidence_quality_temperature must be > 0.")
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -301,6 +308,96 @@ class Criterion(nn.Module):
         return {"loss_rec_fw": nll_loss.mean(),
                 "rec_fw_acc": acc}
     
+    def loss_fw_evidence(self, outputs, targets, indices, log=True):
+        """GT-occupancy-guided temporal evidence reconstruction.
+
+        q_i = fraction of block-i tokens that lie inside the GT clip_mask.
+        r_i = mean log P(true masked words | block_i, masked query).
+
+        The loss aligns the relative evidence distribution with continuous GT
+        occupancy. It intentionally keeps the v1 assumption that every block
+        is scored using all masked words.
+        """
+        block_logits = outputs["fw_evidence_block_logits"]  # (B,K,L,V)
+        masked_words_loc = outputs["fw_evidence_masked_words_loc"].bool()
+        block_occupancy = outputs["fw_evidence_block_occupancy"]  # (B,K)
+        words_mask = outputs["words_mask"].bool()
+        words_label = targets["words_label"].long()
+
+        if block_logits.ndim != 4:
+            raise ValueError(
+                f"Expected fw_evidence_block_logits rank 4, got {block_logits.shape}."
+            )
+        bsz, num_blocks, text_len, _ = block_logits.shape
+        if words_label.shape != (bsz, text_len):
+            raise ValueError(
+                f"words_label shape {tuple(words_label.shape)} does not match "
+                f"(B,L)=({bsz},{text_len})."
+            )
+        if block_occupancy.shape != (bsz, num_blocks):
+            raise ValueError(
+                f"fw_evidence_block_occupancy shape {tuple(block_occupancy.shape)} "
+                f"does not match (B,K)=({bsz},{num_blocks})."
+            )
+
+        block_occupancy = block_occupancy.to(
+            device=block_logits.device, dtype=block_logits.dtype
+        ).clamp(0.0, 1.0)
+
+        evidence_word_mask = masked_words_loc & words_mask
+        valid_sample_mask = evidence_word_mask.any(dim=1)
+
+        # r_i = mean log P(true masked words | block_i, masked query)
+        block_log_probs = F.log_softmax(block_logits, dim=-1)
+        gather_index = words_label[:, None, :, None].expand(
+            -1, num_blocks, -1, 1
+        )
+        true_word_log_prob = block_log_probs.gather(
+            dim=-1, index=gather_index
+        ).squeeze(-1)
+
+        evidence_mask_f = evidence_word_mask[:, None, :].to(
+            dtype=true_word_log_prob.dtype
+        )
+        masked_count = evidence_mask_f.sum(dim=-1).clamp(min=1.0)
+        block_evidence_scores = (
+            (true_word_log_prob * evidence_mask_f).sum(dim=-1) / masked_count
+        )
+
+        # Continuous GT occupancy -> soft target evidence distribution.
+        target_distribution = F.softmax(
+            block_occupancy / self.fw_evidence_quality_temperature, dim=1
+        )
+        predicted_log_distribution = F.log_softmax(
+            block_evidence_scores, dim=1
+        )
+        per_sample_loss = -(
+            target_distribution * predicted_log_distribution
+        ).sum(dim=1)
+
+        if valid_sample_mask.any():
+            loss = per_sample_loss[valid_sample_mask].mean()
+
+            # Occupancy can have ties (e.g., two blocks both fully inside GT).
+            # Count prediction as correct if it selects ANY maximal-quality block.
+            predicted_top1 = block_evidence_scores.argmax(dim=1)
+            max_quality = block_occupancy.max(dim=1, keepdim=True).values
+            top_quality_mask = torch.isclose(
+                block_occupancy, max_quality, rtol=0.0, atol=1e-6
+            )
+            top1_is_valid = top_quality_mask.gather(
+                dim=1, index=predicted_top1.unsqueeze(1)
+            ).squeeze(1)
+            top1_acc = top1_is_valid[valid_sample_mask].float().mean()
+        else:
+            loss = block_evidence_scores.sum() * 0.0
+            top1_acc = block_evidence_scores.new_tensor(0.0)
+
+        return {
+            "loss_fw_evidence": loss,
+            "fw_evidence_top1_acc": top1_acc,
+        }
+
     def cal_nll_loss(self, logit, idx, mask, weights=None):
         eps = 0.1
         acc = (logit.max(dim=-1)[1]==idx).float()
@@ -325,6 +422,7 @@ class Criterion(nn.Module):
             "saliency": self.loss_saliency,
             "rec_ss": self.loss_rec_ss,
             "rec_fw": self.loss_rec_fw,
+            "fw_evidence": self.loss_fw_evidence,
             "path_balance": self.loss_path_balance,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -354,7 +452,7 @@ class Criterion(nn.Module):
         losses = {}
         # for loss in self.losses:
         for loss in losses_target:
-            if loss == "rec_fw" and not is_training:
+            if loss in ["rec_fw", "fw_evidence"] and not is_training:
                 continue
             losses.update(self.get_loss(loss, outputs, targets, indices))
 
@@ -369,7 +467,7 @@ class Criterion(nn.Module):
                 #     indices = None
                 #     losses_target = ["saliency"]    
                 for loss in losses_target:
-                    if loss in ["saliency", "bg_rank", "rec_ss", "rec_fw"]:
+                    if loss in ["saliency", "bg_rank", "rec_ss", "rec_fw", "fw_evidence"]:
                         continue
                     kwargs = {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, **kwargs)

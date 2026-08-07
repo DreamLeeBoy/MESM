@@ -25,6 +25,8 @@ class MESM(nn.Module):
             span_loss_type="l1", n_input_proj=2,
             rec_fw=False, vocab_size=1111,
             rec_ss=False, num_recss_layers=2,
+            use_fw_evidence=False, fw_evidence_num_blocks=4,
+            fw_evidence_position_mode="local",
     ):
         super().__init__()
         self.text_encoder = text_encoder
@@ -77,6 +79,18 @@ class MESM(nn.Module):
 
         # frame-word level masked language modeling (reconstruction)
         self.rec_fw = rec_fw
+        self.use_fw_evidence = bool(use_fw_evidence)
+        self.fw_evidence_num_blocks = int(fw_evidence_num_blocks)
+        self.fw_evidence_position_mode = str(fw_evidence_position_mode).lower()
+        if self.use_fw_evidence and not self.rec_fw:
+            raise ValueError("FW evidence modeling requires rec_fw=True.")
+        if self.use_fw_evidence and self.fw_evidence_num_blocks < 2:
+            raise ValueError("fw_evidence_num_blocks must be >= 2.")
+        if self.fw_evidence_position_mode not in {"local", "global", "none"}:
+            raise ValueError(
+                "fw_evidence_position_mode must be one of: local, global, none."
+            )
+
         if isinstance(self.text_encoder, CLIPTextEncoder):
             num_classes = vocab_size + 3
         elif isinstance(self.text_encoder, GloveTextEncoder) or self.text_encoder is None:
@@ -155,6 +169,84 @@ class MESM(nn.Module):
         if self.normalize_txt:
             sentence_feat = F.normalize(sentence_feat, dim=-1, p=2, eps=1e-5)
         return words_feat, words_mask, sentence_feat
+
+    def _build_equal_temporal_blocks(
+        self, video_feat, video_mask, clip_mask, video_pos, num_blocks
+    ):
+        """Build exact token blocks and their GT occupancy.
+
+        The same integer token boundaries are used for:
+          1) slicing video features,
+          2) slicing optional global positions,
+          3) computing GT occupancy from clip_mask.
+
+        This removes the v1 mismatch between integer token blocks and idealized
+        fixed quarter boundaries in normalized time.
+        """
+        if video_feat.ndim != 3 or video_mask.ndim != 2 or clip_mask.ndim != 2:
+            raise ValueError("Unexpected tensor rank for FW evidence blocks.")
+        if video_feat.shape[:2] != video_mask.shape:
+            raise ValueError("video_feat and video_mask shapes are inconsistent.")
+        if clip_mask.shape != video_mask.shape:
+            raise ValueError("clip_mask and video_mask shapes are inconsistent.")
+        if video_pos.shape != video_feat.shape:
+            raise ValueError("video_pos and video_feat shapes are inconsistent.")
+
+        valid_lengths = video_mask.long().sum(dim=1)
+        if torch.any(valid_lengths < num_blocks):
+            bad = valid_lengths[valid_lengths < num_blocks].detach().cpu().tolist()
+            raise ValueError(
+                f"FW evidence needs at least {num_blocks} valid video tokens per sample; "
+                f"found lengths {bad}."
+            )
+
+        feat_chunks = []
+        global_pos_chunks = []
+        occupancy_values = []
+        chunk_lengths = []
+
+        for b in range(video_feat.size(0)):
+            n = int(valid_lengths[b].item())
+            for k in range(num_blocks):
+                start = (k * n) // num_blocks
+                end = ((k + 1) * n) // num_blocks
+                if end <= start:
+                    raise RuntimeError(
+                        f"Empty FW evidence block: sample={b}, block={k}, valid_length={n}."
+                    )
+
+                feat_chunks.append(video_feat[b, start:end])
+                global_pos_chunks.append(video_pos[b, start:end])
+                chunk_lengths.append(end - start)
+
+                # Original idea: how much of THIS block belongs to the GT moment?
+                # q_i = |B_i ∩ GT| / |B_i|, computed in the exact token space
+                # used to slice B_i.
+                block_gt = clip_mask[b, start:end].float()
+                occupancy_values.append(block_gt.mean())
+
+        max_len = max(chunk_lengths)
+        total_blocks = len(feat_chunks)
+        dim = video_feat.size(-1)
+
+        block_feat = video_feat.new_zeros((total_blocks, max_len, dim))
+        block_global_pos = video_pos.new_zeros((total_blocks, max_len, dim))
+        block_mask = torch.zeros(
+            (total_blocks, max_len), dtype=torch.bool, device=video_mask.device
+        )
+
+        for i, (feat_chunk, pos_chunk, length) in enumerate(
+            zip(feat_chunks, global_pos_chunks, chunk_lengths)
+        ):
+            block_feat[i, :length] = feat_chunk
+            block_global_pos[i, :length] = pos_chunk
+            block_mask[i, :length] = True
+
+        block_occupancy = torch.stack(occupancy_values, dim=0).reshape(
+            video_feat.size(0), num_blocks
+        ).to(dtype=video_feat.dtype)
+
+        return block_feat, block_mask, block_global_pos, block_occupancy
 
     def forward(self, video_feat, video_mask, words_id, words_mask, words_weight, num_clips, **kwargs):
         if isinstance(self.text_encoder, CLIPTextEncoder):
@@ -330,24 +422,28 @@ class MESM(nn.Module):
 
         if self.rec_fw and kwargs["is_training"]:
             unknown_mask = kwargs["unknown_mask"]
-            unknowned_words_feat = self._replace_unknown(projed_words_feat, unknown_mask, self.unknown_token, proj=True)
+            unknowned_words_feat = self._replace_unknown(
+                projed_words_feat, unknown_mask, self.unknown_token, proj=True
+            )
+
+            # Original FW-MESM branch remains unchanged: GT clip -> masked-word reconstruction.
             clip_mask = kwargs["clip_mask"]
             selected_video_feat = projed_video_feat[clip_mask]
             selected_length = clip_mask.sum(dim=1)
-            merged_clip_feat, merged_clip_mask = split_and_pad(selected_length, selected_video_feat)
+            merged_clip_feat, merged_clip_mask = split_and_pad(
+                selected_length, selected_video_feat
+            )
 
-            masked_words_feat, masked_words_loc = self._mask_words(unknowned_words_feat, words_mask, self.masked_token,
-                                                                   proj=True, weight=words_weight)
-            # if self.rec_ss:
-            #     expanded_masked_words_feat = torch.cat([recon_feat.unsqueeze(1), masked_words_feat], dim=1)
-            # else:
-            #     expanded_masked_words_feat = masked_words_feat
-            # ## ablation 1
-            # merged_clip_position = self.vid_position_embed(merged_clip_feat, merged_clip_mask)
+            # Sample one masked-query pattern and reuse it for all evidence blocks.
+            masked_words_feat, masked_words_loc = self._mask_words(
+                unknowned_words_feat, words_mask, self.masked_token,
+                proj=True, weight=words_weight
+            )
 
-            ## ablation 2
             selected_vid_position = vid_position[clip_mask]
-            merged_clip_position, _ = split_and_pad(selected_length, selected_vid_position)
+            merged_clip_position, _ = split_and_pad(
+                selected_length, selected_vid_position
+            )
 
             recfw_out = self.enhance_encoder(
                 merged_clip_feat, masked_words_feat,
@@ -355,6 +451,54 @@ class MESM(nn.Module):
                 src_vid_key_padding_mask=~words_mask, pos_vid=txt_position, is_MLM=True
             )
             recfw_words_logit = self.output_txt_proj(recfw_out)
+
+            # New: K equal blocks independently reconstruct the same masked query,
+            # using exactly the same shared FW cross-attention and word projection.
+            if self.use_fw_evidence:
+                num_blocks = self.fw_evidence_num_blocks
+                block_feat, block_mask, block_global_pos, fw_evidence_block_occupancy = (
+                    self._build_equal_temporal_blocks(
+                        projed_video_feat, video_mask, clip_mask, vid_position, num_blocks
+                    )
+                )
+
+                # Position-shortcut control:
+                # local  -> re-index every block from its own local beginning;
+                # global -> v1 behavior (keep original full-video position);
+                # none   -> diagnostic only.
+                if self.fw_evidence_position_mode == "local":
+                    block_pos = self.vid_position_embed(block_feat, block_mask)
+                elif self.fw_evidence_position_mode == "global":
+                    block_pos = block_global_pos
+                else:
+                    block_pos = torch.zeros_like(block_feat)
+
+                bsz, text_len, hidden_dim = masked_words_feat.shape
+                block_masked_words_feat = (
+                    masked_words_feat.unsqueeze(1)
+                    .expand(-1, num_blocks, -1, -1)
+                    .reshape(bsz * num_blocks, text_len, hidden_dim)
+                )
+                block_words_mask = (
+                    words_mask.unsqueeze(1)
+                    .expand(-1, num_blocks, -1)
+                    .reshape(bsz * num_blocks, text_len)
+                )
+                block_txt_position = (
+                    txt_position.unsqueeze(1)
+                    .expand(-1, num_blocks, -1, -1)
+                    .reshape(bsz * num_blocks, text_len, hidden_dim)
+                )
+                block_recfw_out = self.enhance_encoder(
+                    block_feat, block_masked_words_feat,
+                    src_txt_key_padding_mask=~block_mask, pos_txt=block_pos,
+                    src_vid_key_padding_mask=~block_words_mask,
+                    pos_vid=block_txt_position, is_MLM=True
+                )
+                block_recfw_logits = self.output_txt_proj(block_recfw_out)
+                fw_evidence_block_logits = block_recfw_logits.reshape(
+                    bsz, num_blocks, text_len, -1
+                )
 
         out = {
             "pred_logits": outputs_class[-1],
@@ -381,6 +525,12 @@ class MESM(nn.Module):
                 "words_mask": words_mask,
                 "recfw_words_logit": recfw_words_logit,
             })
+            if self.use_fw_evidence:
+                out.update({
+                    "fw_evidence_block_logits": fw_evidence_block_logits,
+                    "fw_evidence_masked_words_loc": masked_words_loc.bool(),
+                    "fw_evidence_block_occupancy": fw_evidence_block_occupancy,
+                })
 
         return out
 

@@ -299,6 +299,11 @@ def build_model(args, vocab=None):
             vocab_size=args.vocab_size,
             rec_ss=args.rec_ss,
             num_recss_layers=args.num_recss_layers,
+            use_fw_evidence=bool(getattr(args, "use_fw_evidence", False)),
+            fw_evidence_num_blocks=int(getattr(args, "fw_evidence_num_blocks", 4)),
+            fw_evidence_position_mode=str(
+                getattr(args, "fw_evidence_position_mode", "local")
+            ),
     )
     model.to(args.device)
     return model
@@ -333,7 +338,48 @@ def build_criterion(args):
     if args.rec_fw:
         losses.append("rec_fw")
         weight_dict["loss_rec_fw"] = args.loss_recfw_coef
-    
+
+    use_fw_evidence = bool(getattr(args, "use_fw_evidence", False))
+    if use_fw_evidence:
+        if not args.rec_fw:
+            raise ValueError("use_fw_evidence=True requires rec_fw=True.")
+        if args.dataset_name == "qvhighlights":
+            raise NotImplementedError(
+                "FW occupancy evidence currently supports one GT moment per query only."
+            )
+        num_blocks = int(getattr(args, "fw_evidence_num_blocks", 4))
+        quality_temperature = float(
+            getattr(
+                args,
+                "fw_evidence_quality_temperature",
+                getattr(args, "fw_evidence_iou_temperature", 0.25),
+            )
+        )
+        position_mode = str(
+            getattr(args, "fw_evidence_position_mode", "local")
+        ).lower()
+        if num_blocks < 2:
+            raise ValueError("fw_evidence_num_blocks must be >= 2.")
+        if quality_temperature <= 0:
+            raise ValueError("fw_evidence_quality_temperature must be > 0.")
+        if position_mode not in {"local", "global", "none"}:
+            raise ValueError(
+                "fw_evidence_position_mode must be local, global, or none."
+            )
+
+        losses.append("fw_evidence")
+        weight_dict["loss_fw_evidence"] = float(
+            getattr(args, "loss_fw_evidence_coef", 0.05)
+        )
+        logger.info(
+            "[FW EVIDENCE] enabled=True target=gt_occupancy num_blocks=%d "
+            "position=%s quality_temperature=%.4f coef=%.6f",
+            num_blocks,
+            position_mode,
+            quality_temperature,
+            weight_dict["loss_fw_evidence"],
+        )
+
     if args.rec_ss:
         losses.append("rec_ss")
         weight_dict["loss_rec_ss"] = args.loss_recss_coef
@@ -348,7 +394,14 @@ def build_criterion(args):
         # recfw_margin=args.recfw_margin,
         multi_clip=args.dataset_name in ["qvhighlights"],
         gamma=args.iou_gamma,
-        recss_tau=args.recss_tau
+        recss_tau=args.recss_tau,
+        fw_evidence_quality_temperature=float(
+            getattr(
+                args,
+                "fw_evidence_quality_temperature",
+                getattr(args, "fw_evidence_iou_temperature", 0.25),
+            )
+        )
     )
     criterion.to(args.device)
     return criterion
