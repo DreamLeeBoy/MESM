@@ -1,1 +1,0 @@
-../charades/annotations/CLIP_tokenized_count.txt
