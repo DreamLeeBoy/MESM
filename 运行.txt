@@ -1,0 +1,19 @@
+cd ~/MESM_clone
+
+chmod +x train_all_baselines.sh
+
+./train_all_baselines.sh 0
+
+后台运行：
+cd ~/MESM_clone
+
+nohup ./train_all_baselines.sh 0 > train_all_baselines.out 2>&1 &
+
+检查是否还在运行：
+ps -ef | grep train.py
+
+
+
+
+数据集Vgg_GlOVe 与 Tacos需要单独进行训练：
+cd ~/MESM_clone && python train.py --config_file ./config/charades/VGG_GloVe.json && python train.py --config_file ./config/TACoS/C3D_GloVe.json
