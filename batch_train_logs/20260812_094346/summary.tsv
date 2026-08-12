@@ -1,0 +1,6 @@
+index	name	config	status	exit_code	start_time	end_time	log
+1	charades_C+SF_C	config/charades/C+SF_C.json	SUCCESS	0	2026-08-12 09:43:46	2026-08-12 15:09:41	/home/jzp/MESM_clone/batch_train_logs/20260812_094346/1_charades_C+SF_C.log
+2	charades_VGG_GloVe	config/charades/VGG_GloVe.json	FAILED	1	2026-08-12 15:09:46	2026-08-12 15:18:38	/home/jzp/MESM_clone/batch_train_logs/20260812_094346/2_charades_VGG_GloVe.log
+3	charades_cg_C+SF_C	config/Charades-CG/C+SF_C.json	SUCCESS	0	2026-08-12 15:18:43	2026-08-12 16:42:29	/home/jzp/MESM_clone/batch_train_logs/20260812_094346/3_charades_cg_C+SF_C.log
+4	qvhighlights_C+SF_C	config/QVHighlights/C+SF_C.json	SUCCESS	0	2026-08-12 16:42:34	2026-08-12 18:06:33	/home/jzp/MESM_clone/batch_train_logs/20260812_094346/4_qvhighlights_C+SF_C.log
+5	tacos_C3D_GloVe	config/TACoS/C3D_GloVe.json	FAILED	1	2026-08-12 18:06:38	2026-08-12 18:07:02	/home/jzp/MESM_clone/batch_train_logs/20260812_094346/5_tacos_C3D_GloVe.log
