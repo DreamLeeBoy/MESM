@@ -70,17 +70,17 @@ class Criterion(nn.Module):
         self.bg_candidate_widths = tuple(bg_candidate_widths)
 
         # Span-query complementary learning (CDL-style temporal hypotheses).
-        # The K learnable span queries are interpreted as latent temporal
-        # hypothesis classes.  L1 distances between every predicted span and
-        # the GT construct two detached soft targets:
-        #   similarity target     = softmax(-distance / tau_d)
-        #   complementary target  = softmax(+distance / tau_d)
-        # They supervise softmax(+score) and softmax(-score), respectively.
-        # Keeping the distance target detached avoids a self-referential target
-        # in which the classification loss could reduce itself by moving spans.
+        # Keep the original Hungarian-matched foreground query as the unique
+        # winner under the standard DETR label loss.  CDL is applied only to
+        # unmatched temporal hypotheses: their detached L1 distance to the GT
+        # defines a complementary target softmax(+distance / tau_d), which
+        # supervises softmax(-foreground_score / tau_s).  This preserves the
+        # winner status instead of softening the positive-query supervision.
         self.span_cdl_distance_tau = 0.2
         self.span_cdl_score_tau = 1.0
-        self.weight_dict.setdefault("loss_span_cdl_similarity", 1.0)
+        # Remove the first-version similarity term if an external builder still
+        # supplies its weight, then enable only the complementary objective.
+        self.weight_dict.pop("loss_span_cdl_similarity", None)
         self.weight_dict.setdefault("loss_span_cdl_complementary", 1.0)
     
     def _get_src_permutation_idx(self, indices):
@@ -139,47 +139,77 @@ class Criterion(nn.Module):
 
         return distances.detach()
 
-    def loss_span_query_cdl(self, outputs, targets):
-        """Similarity/complementary distribution learning over span queries.
+    def loss_span_query_cdl(self, outputs, targets, indices):
+        """Complementary distribution learning over *unmatched* span queries.
 
-        The existing DETR label loss only distinguishes matched foreground from
-        unmatched background.  This loss additionally models *how close* or
-        *how far* every temporal hypothesis is from the GT.
+        The Hungarian-matched query remains supervised only by the original
+        DETR foreground/background classification loss.  Among the remaining
+        temporal hypotheses, larger L1 distance to the GT means stronger
+        complementarity.  The detached geometry target is matched against the
+        reversed query-score distribution, so the classification objective
+        cannot reduce itself by moving the predicted spans.
         """
         if self.span_loss_type != "l1":
-            zero = outputs["pred_logits"].new_zeros(())
-            return {
-                "loss_span_cdl_similarity": zero,
-                "loss_span_cdl_complementary": zero,
-            }
+            return {"loss_span_cdl_complementary": outputs["pred_logits"].new_zeros(())}
 
-        distances = self._span_query_l1_distances(outputs, targets)  # [B, K]
+        distances = self._span_query_l1_distances(outputs, targets)  # [B, K], detached
 
-        # A single scalar score per temporal hypothesis.  Using the foreground
-        # minus background margin preserves all information in the 2-way head
-        # and is invariant to adding the same constant to both class logits.
+        # A single scalar foreground score per temporal hypothesis.  The margin
+        # is invariant to adding the same constant to both 2-way class logits.
         logits = outputs["pred_logits"]
         query_scores = logits[..., self.foreground_label] - logits[..., self.background_label]
+
+        batch_size, num_queries = query_scores.shape
+        matched_mask = torch.zeros(
+            (batch_size, num_queries), dtype=torch.bool, device=query_scores.device
+        )
+
+        if self.multi_clip:
+            if len(indices) != batch_size:
+                raise ValueError("multi-clip matcher output must have one index tuple per batch item")
+            for batch_idx, (src_idx, _) in enumerate(indices):
+                if src_idx.numel() == 0:
+                    continue
+                src_idx = src_idx.to(device=query_scores.device, dtype=torch.long)
+                matched_mask[batch_idx, src_idx] = True
+        else:
+            if not torch.is_tensor(indices) or indices.ndim != 2 or indices.size(0) != batch_size:
+                raise ValueError("single-moment matcher output must have shape [B, num_matches]")
+            matched_idx = indices[:, 0].to(device=query_scores.device, dtype=torch.long)
+            matched_mask[torch.arange(batch_size, device=query_scores.device), matched_idx] = True
 
         tau_d = max(float(self.span_cdl_distance_tau), 1e-6)
         tau_s = max(float(self.span_cdl_score_tau), 1e-6)
 
-        similarity_target = F.softmax(-distances / tau_d, dim=1)
-        complementary_target = F.softmax(distances / tau_d, dim=1)
+        per_sample_losses = []
+        for batch_idx in range(batch_size):
+            # Samples without a matched localization target have no well-defined
+            # complementary relation and are therefore skipped.
+            if not matched_mask[batch_idx].any():
+                continue
 
-        log_similarity_pred = F.log_softmax(query_scores / tau_s, dim=1)
-        log_complementary_pred = F.log_softmax(-query_scores / tau_s, dim=1)
+            unmatched_mask = ~matched_mask[batch_idx]
+            if unmatched_mask.sum() == 0:
+                continue
 
-        loss_similarity = F.kl_div(
-            log_similarity_pred, similarity_target, reduction="batchmean"
-        )
-        loss_complementary = F.kl_div(
-            log_complementary_pred, complementary_target, reduction="batchmean"
-        )
-        return {
-            "loss_span_cdl_similarity": loss_similarity,
-            "loss_span_cdl_complementary": loss_complementary,
-        }
+            unmatched_distances = distances[batch_idx, unmatched_mask]
+            unmatched_scores = query_scores[batch_idx, unmatched_mask]
+
+            # Farther temporal hypotheses receive higher complementary target
+            # probability.  The matched winner is absent from both target and
+            # prediction normalizers, so CDL cannot directly suppress it.
+            complementary_target = F.softmax(unmatched_distances / tau_d, dim=0)
+            log_complementary_pred = F.log_softmax(-unmatched_scores / tau_s, dim=0)
+            per_sample_losses.append(
+                F.kl_div(log_complementary_pred, complementary_target, reduction="sum")
+            )
+
+        if not per_sample_losses:
+            loss_complementary = query_scores.new_zeros(())
+        else:
+            loss_complementary = torch.stack(per_sample_losses).mean()
+
+        return {"loss_span_cdl_complementary": loss_complementary}
 
     def loss_spans(self, outputs, targets, indices):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -222,7 +252,7 @@ class Criterion(nn.Module):
         losses['loss_giou'] = loss_giou.mean()
         return losses
 
-    def loss_labels(self, outputs, targets, indices, log=True):
+    def loss_labels(self, outputs, targets, indices, log=True, compute_span_cdl=True):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -244,10 +274,11 @@ class Criterion(nn.Module):
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight, reduction="none")
         losses = {'loss_label': loss_ce.mean()}
 
-        # CDL-style supervision is deliberately attached to the final label
-        # loss rather than the span regression loss: the L1 geometry creates
-        # soft query-class targets, while the target itself is stop-gradient.
-        losses.update(self.loss_span_query_cdl(outputs, targets))
+        # Final-layer-only complementary supervision.  The standard CE above
+        # keeps the Hungarian-matched query as foreground; CDL only structures
+        # the unmatched temporal hypotheses.
+        if compute_span_cdl:
+            losses.update(self.loss_span_query_cdl(outputs, targets, indices))
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
@@ -477,6 +508,9 @@ class Criterion(nn.Module):
                     if loss in ["saliency", "bg_rank", "rec_ss", "rec_fw"]:
                         continue
                     kwargs = {}
+                    if loss == "label":
+                        # Do not apply Span-CDL to intermediate decoder outputs.
+                        kwargs["compute_span_cdl"] = False
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
