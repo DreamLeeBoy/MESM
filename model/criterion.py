@@ -68,6 +68,20 @@ class Criterion(nn.Module):
         self.bg_iou_threshold = bg_iou_threshold
         self.bg_candidate_centers = bg_candidate_centers
         self.bg_candidate_widths = tuple(bg_candidate_widths)
+
+        # Span-query complementary learning (CDL-style temporal hypotheses).
+        # The K learnable span queries are interpreted as latent temporal
+        # hypothesis classes.  L1 distances between every predicted span and
+        # the GT construct two detached soft targets:
+        #   similarity target     = softmax(-distance / tau_d)
+        #   complementary target  = softmax(+distance / tau_d)
+        # They supervise softmax(+score) and softmax(-score), respectively.
+        # Keeping the distance target detached avoids a self-referential target
+        # in which the classification loss could reduce itself by moving spans.
+        self.span_cdl_distance_tau = 0.2
+        self.span_cdl_score_tau = 1.0
+        self.weight_dict.setdefault("loss_span_cdl_similarity", 1.0)
+        self.weight_dict.setdefault("loss_span_cdl_complementary", 1.0)
     
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
@@ -80,6 +94,92 @@ class Criterion(nn.Module):
         batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
+
+    def _span_query_l1_distances(self, outputs, targets):
+        """Return detached L1 distances from each span query to its closest GT.
+
+        Returns:
+            distances: [B, K].  For single-moment datasets this is simply the
+                L1 distance from each predicted (center, width) span to the GT.
+                For multi-moment samples the closest GT span is used so that a
+                legitimate second moment is not incorrectly treated as a strong
+                complementary hypothesis.
+        """
+        pred_spans = outputs["pred_spans"]  # [B, K, 2], normalized (center, width)
+        if pred_spans.ndim != 3 or pred_spans.size(-1) != 2:
+            raise ValueError(
+                "span-query CDL requires pred_spans with shape [B, K, 2] "
+                "and span_loss_type='l1'"
+            )
+
+        if self.multi_clip:
+            batch_distances = []
+            for batch_idx in range(pred_spans.size(0)):
+                target_item = targets["norm_span"][batch_idx]
+                gt_spans = target_item["spans"] if isinstance(target_item, dict) else target_item
+                gt_spans = gt_spans.to(device=pred_spans.device, dtype=pred_spans.dtype)
+                if gt_spans.ndim == 1:
+                    gt_spans = gt_spans.unsqueeze(0)
+                if gt_spans.numel() == 0:
+                    # No localization target: do not invent a relative geometry.
+                    batch_distances.append(pred_spans.new_zeros(pred_spans.size(1)))
+                else:
+                    pairwise_l1 = torch.cdist(pred_spans[batch_idx], gt_spans, p=1)
+                    batch_distances.append(pairwise_l1.min(dim=1).values)
+            distances = torch.stack(batch_distances, dim=0)
+        else:
+            gt_spans = targets["norm_span"].to(device=pred_spans.device, dtype=pred_spans.dtype)
+            if gt_spans.ndim == 1:
+                gt_spans = gt_spans.unsqueeze(0)
+            if gt_spans.ndim != 2 or gt_spans.size(0) != pred_spans.size(0) or gt_spans.size(-1) != 2:
+                raise ValueError(
+                    "expected targets['norm_span'] with shape [B, 2] for single-moment datasets"
+                )
+            distances = torch.abs(pred_spans - gt_spans.unsqueeze(1)).sum(dim=-1)
+
+        return distances.detach()
+
+    def loss_span_query_cdl(self, outputs, targets):
+        """Similarity/complementary distribution learning over span queries.
+
+        The existing DETR label loss only distinguishes matched foreground from
+        unmatched background.  This loss additionally models *how close* or
+        *how far* every temporal hypothesis is from the GT.
+        """
+        if self.span_loss_type != "l1":
+            zero = outputs["pred_logits"].new_zeros(())
+            return {
+                "loss_span_cdl_similarity": zero,
+                "loss_span_cdl_complementary": zero,
+            }
+
+        distances = self._span_query_l1_distances(outputs, targets)  # [B, K]
+
+        # A single scalar score per temporal hypothesis.  Using the foreground
+        # minus background margin preserves all information in the 2-way head
+        # and is invariant to adding the same constant to both class logits.
+        logits = outputs["pred_logits"]
+        query_scores = logits[..., self.foreground_label] - logits[..., self.background_label]
+
+        tau_d = max(float(self.span_cdl_distance_tau), 1e-6)
+        tau_s = max(float(self.span_cdl_score_tau), 1e-6)
+
+        similarity_target = F.softmax(-distances / tau_d, dim=1)
+        complementary_target = F.softmax(distances / tau_d, dim=1)
+
+        log_similarity_pred = F.log_softmax(query_scores / tau_s, dim=1)
+        log_complementary_pred = F.log_softmax(-query_scores / tau_s, dim=1)
+
+        loss_similarity = F.kl_div(
+            log_similarity_pred, similarity_target, reduction="batchmean"
+        )
+        loss_complementary = F.kl_div(
+            log_complementary_pred, complementary_target, reduction="batchmean"
+        )
+        return {
+            "loss_span_cdl_similarity": loss_similarity,
+            "loss_span_cdl_complementary": loss_complementary,
+        }
 
     def loss_spans(self, outputs, targets, indices):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -114,7 +214,7 @@ class Criterion(nn.Module):
             #
             # tgt_span_indices = tgt_spans
             # tgt_span_indices[:, 1] += 1
-            # loss_giou = 1 - torch.diag(generalized_temporal_iou(src_span_indices, tgt_span_indices))
+            # loss_giou = 1 - torch.diag(generalized_temporal_iou(src_span_indices, tgt_moments))
             loss_giou = loss_span.new_zeros([1])
 
         losses = {}
@@ -143,6 +243,11 @@ class Criterion(nn.Module):
 
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight, reduction="none")
         losses = {'loss_label': loss_ce.mean()}
+
+        # CDL-style supervision is deliberately attached to the final label
+        # loss rather than the span regression loss: the L1 geometry creates
+        # soft query-class targets, while the target itself is stop-gradient.
+        losses.update(self.loss_span_query_cdl(outputs, targets))
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
