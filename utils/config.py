@@ -121,8 +121,16 @@ class BaseOptions(object):
                             help="Relative classification weight of the no-object class")
         parser.add_argument("--loss_recfw_coef", default=0, type=float)
         parser.add_argument("--loss_recss_coef", default=0, type=float)
+        parser.add_argument("--loss_recss_complementary_coef", default=0.0, type=float,
+                            help="weight for complementary learning over rec_ss negative candidates")
         parser.add_argument("--iou_gamma", default=0.9, type=float)
         parser.add_argument("--recss_tau", default=0.5, type=float)
+        parser.add_argument("--recss_comp_tau_d", default=0.2, type=float,
+                            help="temperature for temporal/semantic dissimilarity targets")
+        parser.add_argument("--recss_comp_tau_s", default=1.0, type=float,
+                            help="temperature for negated rec_ss similarity scores")
+        parser.add_argument("--recss_comp_temporal_weight", default=0.5, type=float,
+                            help="temporal weight in the mixed dissimilarity target; semantic uses 1-weight")
 
         ## train
         parser.add_argument("--exp_id", type=str, default=None,
@@ -267,4 +275,3 @@ class TestOptions(BaseOptions):
                                  help="dir to save results, if not set, fall back to training results_dir")
         self.parser.add_argument("--trained_result_dir", type=str,
                                  help="dir contains the model file, will be converted to absolute path afterwards")
-

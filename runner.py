@@ -1,3 +1,4 @@
+import math
 import os
 import pickle
 import torch
@@ -315,6 +316,23 @@ def build_matcher(args):
 def build_criterion(args):
     logger.info("Building criterion...")
     matcher = build_matcher(args)
+    recss_complementary_coef = getattr(args, "loss_recss_complementary_coef", 0.0)
+    if not (
+        math.isfinite(float(recss_complementary_coef))
+        and recss_complementary_coef >= 0
+    ):
+        raise ValueError(
+            "loss_recss_complementary_coef must be finite and non-negative"
+        )
+    recss_coef = float(args.loss_recss_coef)
+    if recss_complementary_coef > 0 and (
+        not args.rec_ss or not math.isfinite(recss_coef) or recss_coef <= 0
+    ):
+        raise ValueError(
+            "loss_recss_complementary_coef > 0 requires rec_ss=True "
+            "and a finite loss_recss_coef > 0"
+        )
+
     losses = ['span', 'label', 'saliency']
     weight_dict = {"loss_span": args.loss_span_coef,
                    "loss_giou": args.loss_giou_coef,
@@ -337,6 +355,9 @@ def build_criterion(args):
     if args.rec_ss:
         losses.append("rec_ss")
         weight_dict["loss_rec_ss"] = args.loss_recss_coef
+        if recss_complementary_coef > 0:
+            losses.append("rec_ss_complementary")
+            weight_dict["loss_rec_ss_complementary"] = recss_complementary_coef
 
     criterion = Criterion(
         matcher=matcher, weight_dict=weight_dict, losses=losses,
@@ -348,7 +369,12 @@ def build_criterion(args):
         # recfw_margin=args.recfw_margin,
         multi_clip=args.dataset_name in ["qvhighlights"],
         gamma=args.iou_gamma,
-        recss_tau=args.recss_tau
+        recss_tau=args.recss_tau,
+        recss_comp_tau_d=getattr(args, "recss_comp_tau_d", 0.2),
+        recss_comp_tau_s=getattr(args, "recss_comp_tau_s", 1.0),
+        recss_comp_temporal_weight=getattr(
+            args, "recss_comp_temporal_weight", 0.5
+        ),
     )
     criterion.to(args.device)
     return criterion
