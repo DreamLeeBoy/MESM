@@ -111,7 +111,11 @@ def train():
         vocab = None
     train_loader, val_loaders, _ = build_dataloader(opt, vocab)
     model = build_model(opt, vocab)
-    criterion = build_criterion(opt)
+    # FW-CDL:
+    # Forward word-level complementary learning
+    criterion = build_criterion(
+        opt, model=model, tokenizer=train_loader.dataset.tokenizer
+    )
     optimizer, lr_scheduler = build_optimizer(opt, model)
 
     if opt.resume is not None:

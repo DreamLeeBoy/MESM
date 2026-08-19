@@ -5,7 +5,6 @@ from torch import nn
 import torch.nn.functional as F
 
 from utils import generalized_temporal_iou, span_cxw_to_xx
-from utils.span_utils import temporal_iou
 from utils import accuracy
 
 
@@ -26,9 +25,11 @@ class Criterion(nn.Module):
                  bg_iou_threshold=0.1,
                  bg_candidate_centers=39,
                  bg_candidate_widths=(0.05, 0.10, 0.15, 0.20, 0.30),
-                 recss_comp_tau_d=0.2,
-                 recss_comp_tau_s=1.0,
-                 recss_comp_temporal_weight=0.5):
+                 # FW-CDL:
+                 # Forward word-level complementary learning
+                 fw_cdl_tau=0.07,
+                 fw_cdl_class_pos=None,
+                 fw_cdl_class_features=None):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -61,36 +62,49 @@ class Criterion(nn.Module):
 
         # addtional losses
         self.rec_ss = "rec_ss" in losses
-        self.rec_ss_complementary = "rec_ss_complementary" in losses
         self.rec_fw = "rec_fw" in losses
         self.multi_clip = multi_clip
         self.gamma = gamma
         self.recss_tau = recss_tau
-        self.recss_comp_tau_d = recss_comp_tau_d
-        self.recss_comp_tau_s = recss_comp_tau_s
-        self.recss_comp_temporal_weight = recss_comp_temporal_weight
 
         if self.rec_ss and not (
             math.isfinite(float(self.recss_tau)) and self.recss_tau > 0
         ):
             raise ValueError("recss_tau must be finite and positive")
-        if self.rec_ss_complementary and not (
-            math.isfinite(float(self.recss_comp_tau_d))
-            and self.recss_comp_tau_d > 0
+
+        # FW-CDL:
+        # Forward word-level complementary learning
+        self.fw_cdl = "fw_cdl" in losses
+        self.fw_cdl_tau = float(fw_cdl_tau)
+        if self.fw_cdl and not (
+            math.isfinite(self.fw_cdl_tau) and self.fw_cdl_tau > 0
         ):
-            raise ValueError("recss_comp_tau_d must be finite and positive")
-        if self.rec_ss_complementary and not (
-            math.isfinite(float(self.recss_comp_tau_s))
-            and self.recss_comp_tau_s > 0
-        ):
-            raise ValueError("recss_comp_tau_s must be finite and positive")
-        if self.rec_ss_complementary and not (
-            math.isfinite(float(self.recss_comp_temporal_weight))
-            and 0.0 <= self.recss_comp_temporal_weight <= 1.0
-        ):
+            raise ValueError("fw_cdl_tau must be finite and positive")
+
+        # FW-CDL:
+        # Forward word-level complementary learning
+        class_pos = torch.as_tensor(
+            [] if fw_cdl_class_pos is None else fw_cdl_class_pos,
+            dtype=torch.long,
+        )
+        class_features = torch.as_tensor(
+            [] if fw_cdl_class_features is None else fw_cdl_class_features,
+            dtype=torch.float32,
+        )
+        if class_features.numel() == 0:
+            class_features = class_features.reshape(0, 0)
+        if class_pos.ndim != 1 or class_features.ndim != 2:
             raise ValueError(
-                "recss_comp_temporal_weight must be finite and in [0, 1]"
+                "FW-CDL class POS metadata must be [C] and features must be [C, D]"
             )
+        if class_pos.size(0) != class_features.size(0):
+            raise ValueError(
+                "FW-CDL class POS metadata and frozen features must have the same class count"
+            )
+        self.register_buffer("fw_cdl_class_pos", class_pos, persistent=False)
+        self.register_buffer(
+            "fw_cdl_class_features", class_features.detach(), persistent=False
+        )
 
         # Background-aware matched-query ranking loss.
         # This is intentionally lightweight: it keeps the original 10-query
@@ -265,165 +279,6 @@ class Criterion(nn.Module):
             loss_saliency = loss_saliency + loss_triplet
         return {"loss_saliency": loss_saliency}
     
-    def _get_rec_ss_moments(self, targets):
-        """Return the legacy NCE moment envelopes and per-candidate GT sets."""
-        if self.multi_clip:
-            moment_sets = []
-            moment_merge = []
-            for target_item in targets["norm_moment"]:
-                moments = target_item["moments"]
-                if moments.ndim == 1:
-                    moments = moments.unsqueeze(0)
-                if moments.ndim != 2 or moments.size(-1) != 2 or moments.numel() == 0:
-                    raise ValueError(
-                        "rec_ss requires at least one normalized [start, end] moment per candidate"
-                    )
-                moment_sets.append(moments)
-                # Preserve the original QVHighlights positive-mask behavior:
-                # multiple windows are represented by their enclosing interval.
-                moment_merge.append(torch.stack([moments.min(), moments.max()]))
-            moment_merge = torch.stack(moment_merge)
-        else:
-            moment_merge = targets["norm_moment"]
-            if moment_merge.ndim != 2 or moment_merge.size(-1) != 2:
-                raise ValueError("rec_ss requires targets['norm_moment'] with shape [N, 2]")
-            moment_sets = [moment_merge[idx:idx + 1] for idx in range(moment_merge.size(0))]
-        return moment_merge, moment_sets
-
-    def _get_rec_ss_contrastive_inputs(self, outputs, targets):
-        """Build the unchanged SS-MESM candidate scores and positive mask."""
-        num_clips = targets["num_clips"]
-        moment_merge, moment_sets = self._get_rec_ss_moments(targets)
-        if int(num_clips.sum()) != moment_merge.size(0):
-            raise ValueError("sum(targets['num_clips']) must match the rec_ss candidate count")
-
-        iou_blocks = [
-            generalized_temporal_iou(moments, moments)
-            for moments in torch.split(moment_merge, num_clips.tolist())
-        ]
-        iou_matrix = torch.block_diag(*iou_blocks)
-
-        pos_mask = iou_matrix >= self.gamma
-        # A candidate is always its own ground-truth positive.  This also keeps
-        # zero-duration annotations out of the complementary pool when IoU is
-        # undefined (0/0) for the legacy geometry helper.
-        pos_mask.fill_diagonal_(True)
-
-        clip_mask = targets["clip_mask"].unsqueeze(-1)
-        clip_feat = outputs["projed_video_feat"] * clip_mask
-        # clip_feat = outputs["enhanced_video_feat"] * clip_mask
-        clip_feat = clip_feat.sum(dim=1) / clip_mask.sum(dim=1)
-
-        # ## ablation 1
-        # words_feat = outputs["projed_recon_feat"]
-
-        # ## ablation 2
-        # words_feat = outputs["recon_feat"]
-
-        ## ablation3
-        words_mask = outputs["expanded_words_mask"].unsqueeze(-1)
-        words_feat = outputs["expanded_words_feat"] * words_mask
-        words_feat = words_feat.sum(dim=1) / words_mask.sum(dim=1)
-
-        ## ablation 1
-        norm_clip_feat = F.normalize(clip_feat, dim=-1, p=2)
-        norm_words_feat = F.normalize(words_feat, dim=-1, p=2)
-        raw_cos_sim = norm_clip_feat @ norm_words_feat.permute(1, 0)
-
-        return raw_cos_sim, pos_mask, norm_words_feat, moment_sets
-
-    def _get_rec_ss_dissimilarities(self, norm_words_feat, moment_sets, targets):
-        """Build detached temporal/semantic candidate dissimilarities.
-
-        Temporal IoU is meaningful only when two candidates refer to the exact
-        same video clip.  This distinction matters for QVHighlights, where one
-        ``num_clips`` group may contain different 150-second subvideos whose
-        normalized local timestamps do not share a temporal coordinate system.
-        """
-        num_candidates = norm_words_feat.size(0)
-        video_ids = targets.get("video_id")
-        if video_ids is None or len(video_ids) != num_candidates:
-            raise ValueError("rec_ss complementary loss requires one video_id per candidate")
-
-        with torch.no_grad():
-            temporal_similarity = norm_words_feat.new_zeros(
-                (num_candidates, num_candidates)
-            )
-            candidate_indices_by_video = {}
-            for candidate_idx, video_id in enumerate(video_ids):
-                candidate_indices_by_video.setdefault(video_id, []).append(candidate_idx)
-            for same_video_indices in candidate_indices_by_video.values():
-                for anchor_offset, anchor_idx in enumerate(same_video_indices):
-                    anchor_moments = moment_sets[anchor_idx]
-                    for candidate_idx in same_video_indices[anchor_offset:]:
-                        candidate_moments = moment_sets[candidate_idx]
-                        pairwise_iou, _ = temporal_iou(anchor_moments, candidate_moments)
-                        pairwise_iou = torch.where(
-                            torch.isfinite(pairwise_iou), pairwise_iou,
-                            torch.zeros_like(pairwise_iou)
-                        )
-                        max_iou = pairwise_iou.max().clamp(min=0.0, max=1.0)
-                        temporal_similarity[anchor_idx, candidate_idx] = max_iou
-                        temporal_similarity[candidate_idx, anchor_idx] = max_iou
-
-            temporal_dissimilarity = 1.0 - temporal_similarity
-            semantic_similarity = (
-                norm_words_feat.detach() @ norm_words_feat.detach().transpose(0, 1)
-            ).clamp(min=-1.0, max=1.0)
-            semantic_dissimilarity = 0.5 * (1.0 - semantic_similarity)
-            alpha = float(self.recss_comp_temporal_weight)
-            dissimilarities = (
-                alpha * temporal_dissimilarity
-                + (1.0 - alpha) * semantic_dissimilarity
-            )
-        return dissimilarities
-
-    def _negative_complementary_kl(self, scores, dissimilarities, negative_mask):
-        """Match dissimilarity and negated-score distributions over negatives."""
-        if scores.shape != dissimilarities.shape or scores.shape != negative_mask.shape:
-            raise ValueError("scores, dissimilarities, and negative_mask must have identical shapes")
-
-        # Transfer the informative row indices once instead of synchronizing
-        # the host with CUDA for every anchor.
-        valid_anchor_indices = torch.where(negative_mask.sum(dim=1) >= 2)[0].tolist()
-        per_anchor_losses = []
-        for anchor_idx in valid_anchor_indices:
-            anchor_negative_mask = negative_mask[anchor_idx]
-
-            negative_scores = scores[anchor_idx, anchor_negative_mask]
-            negative_dissimilarity = dissimilarities[anchor_idx, anchor_negative_mask].detach()
-
-            # Original complementary learning only uses dissimilarity.
-            # For retrieval, however, hard negatives (high similarity but wrong)
-            # are more informative than easy negatives. We therefore construct
-            # a hardness-aware complementary target while keeping the original
-            # KL alignment formulation.
-            hard_negative_weight = F.softmax(
-                negative_scores.detach(), dim=0
-            )
-            temporal_dissimilarity_weight = F.softmax(
-                negative_dissimilarity / self.recss_comp_tau_d, dim=0
-            )
-            target_distribution = (
-                0.5 * temporal_dissimilarity_weight
-                + 0.5 * hard_negative_weight
-            )
-            target_distribution = target_distribution / (
-                target_distribution.sum() + 1e-6
-            )
-
-            log_prediction = F.log_softmax(
-                -negative_scores / self.recss_comp_tau_s,
-                dim=0,
-            )
-            per_anchor_losses.append(
-                F.kl_div(log_prediction, target_distribution, reduction="sum")
-            )
-
-        if not per_anchor_losses:
-            return scores.sum() * 0.0
-        return torch.stack(per_anchor_losses).mean()
-
     def loss_rec_ss(self, outputs, targets, indices, log=True):
         num_clips = targets["num_clips"]
         if self.multi_clip:
@@ -477,17 +332,105 @@ class Criterion(nn.Module):
         losses = {"loss_rec_ss": loss.mean()}
         return losses
 
-    def loss_rec_ss_complementary(self, outputs, targets, indices, log=True):
-        """Complementary learning over the existing SS-MESM negative pool."""
-        raw_scores, pos_mask, norm_words_feat, moment_sets = \
-            self._get_rec_ss_contrastive_inputs(outputs, targets)
-        dissimilarities = self._get_rec_ss_dissimilarities(
-            norm_words_feat, moment_sets, targets
-        )
-        loss = self._negative_complementary_kl(
-            raw_scores, dissimilarities, ~pos_mask
-        )
-        return {"loss_rec_ss_complementary": loss}
+    # FW-CDL:
+    # Forward word-level complementary learning
+    def loss_fw_cdl(self, outputs, targets, indices=None, log=True):
+        """Learn same-POS class diversity for incorrectly reconstructed masks."""
+        recfw_words_logit = outputs["recfw_words_logit"]
+        words_label = targets["words_label"]
+        words_mask = outputs["words_mask"].bool()
+        masked_words = outputs["recfw_masked_words_loc"].bool()
+        zero_loss = recfw_words_logit.sum() * 0.0
+
+        if recfw_words_logit.shape[:2] != words_label.shape:
+            raise ValueError(
+                "recfw_words_logit and targets['words_label'] token grids must match"
+            )
+        if words_mask.shape != words_label.shape or masked_words.shape != words_label.shape:
+            raise ValueError(
+                "FW-CDL valid-word, masked-word, and label token grids must match"
+            )
+
+        num_classes = recfw_words_logit.size(-1)
+        if self.fw_cdl_class_pos.numel() == 0:
+            return {"loss_fw_cdl": zero_loss}
+        if (
+            self.fw_cdl_class_pos.size(0) != num_classes
+            or self.fw_cdl_class_features.size(0) != num_classes
+        ):
+            raise ValueError(
+                "FW-CDL metadata must contain one POS and frozen feature per FW class"
+            )
+
+        masked_valid = masked_words & words_mask
+        if not bool(masked_valid.any()):
+            return {"loss_fw_cdl": zero_loss}
+
+        masked_labels = words_label[masked_valid]
+        if bool(((masked_labels < 0) | (masked_labels >= num_classes)).any()):
+            raise ValueError("masked FW ground-truth label is outside the classifier range")
+        masked_pos = self.fw_cdl_class_pos[masked_labels]
+
+        predicted_words = recfw_words_logit.argmax(dim=-1)
+        wrong_masked = masked_valid & predicted_words.ne(words_label)
+        if not bool(wrong_masked.any()):
+            return {"loss_fw_cdl": zero_loss}
+
+        wrong_logits = recfw_words_logit[wrong_masked]
+        wrong_labels = words_label[wrong_masked]
+        wrong_pos = self.fw_cdl_class_pos[wrong_labels]
+        eligible_pos = torch.unique(wrong_pos[wrong_pos >= 0])
+        if eligible_pos.numel() == 0:
+            return {"loss_fw_cdl": zero_loss}
+
+        per_anchor_losses = []
+        for pos_id in eligible_pos.tolist():
+            batch_candidates = torch.unique(masked_labels[masked_pos == pos_id])
+            if batch_candidates.numel() < 2:
+                candidate_classes = torch.where(
+                    self.fw_cdl_class_pos == pos_id
+                )[0]
+            else:
+                candidate_classes = batch_candidates
+            if candidate_classes.numel() < 2:
+                continue
+
+            anchor_mask = wrong_pos == pos_id
+            anchor_labels = wrong_labels[anchor_mask]
+            anchor_logits = wrong_logits[anchor_mask]
+
+            with torch.no_grad():
+                anchor_features = F.normalize(
+                    self.fw_cdl_class_features[anchor_labels], dim=-1, p=2
+                )
+                candidate_features = F.normalize(
+                    self.fw_cdl_class_features[candidate_classes], dim=-1, p=2
+                )
+                similarity = (
+                    anchor_features @ candidate_features.transpose(0, 1)
+                ).clamp(min=-1.0, max=1.0)
+                dissimilarity = 1.0 - similarity
+                teacher_distribution = F.softmax(
+                    -dissimilarity / self.fw_cdl_tau, dim=-1
+                )
+
+            candidate_logits = anchor_logits.index_select(
+                dim=-1, index=candidate_classes
+            )
+            log_student_distribution = F.log_softmax(
+                candidate_logits / self.fw_cdl_tau, dim=-1
+            )
+            per_anchor_losses.append(
+                F.kl_div(
+                    log_student_distribution,
+                    teacher_distribution,
+                    reduction="none",
+                ).sum(dim=-1)
+            )
+
+        if not per_anchor_losses:
+            return {"loss_fw_cdl": zero_loss}
+        return {"loss_fw_cdl": torch.cat(per_anchor_losses).mean()}
     
     def loss_rec_fw(self, outputs, targets, indices, log=True):
         words_label = targets["words_label"]
@@ -527,8 +470,10 @@ class Criterion(nn.Module):
             "label": self.loss_labels,
             "saliency": self.loss_saliency,
             "rec_ss": self.loss_rec_ss,
-            "rec_ss_complementary": self.loss_rec_ss_complementary,
             "rec_fw": self.loss_rec_fw,
+            # FW-CDL:
+            # Forward word-level complementary learning
+            "fw_cdl": self.loss_fw_cdl,
             "path_balance": self.loss_path_balance,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -558,7 +503,9 @@ class Criterion(nn.Module):
         losses = {}
         # for loss in self.losses:
         for loss in losses_target:
-            if loss == "rec_fw" and not is_training:
+            # FW-CDL:
+            # Forward word-level complementary learning
+            if loss in {"rec_fw", "fw_cdl"} and not is_training:
                 continue
             losses.update(self.get_loss(loss, outputs, targets, indices))
 
@@ -575,7 +522,9 @@ class Criterion(nn.Module):
                 for loss in losses_target:
                     if loss in [
                         "saliency", "bg_rank", "rec_ss",
-                        "rec_ss_complementary", "rec_fw"
+                        # FW-CDL:
+                        # Forward word-level complementary learning
+                        "rec_fw", "fw_cdl"
                     ]:
                         continue
                     kwargs = {}

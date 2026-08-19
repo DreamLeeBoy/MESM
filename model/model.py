@@ -380,6 +380,9 @@ class MESM(nn.Module):
                 # "words_feat": words_feat,
                 "words_mask": words_mask,
                 "recfw_words_logit": recfw_words_logit,
+                # FW-CDL:
+                # Forward word-level complementary learning
+                "recfw_masked_words_loc": masked_words_loc.bool(),
             })
 
         return out

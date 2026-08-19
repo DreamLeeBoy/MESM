@@ -121,16 +121,15 @@ class BaseOptions(object):
                             help="Relative classification weight of the no-object class")
         parser.add_argument("--loss_recfw_coef", default=0, type=float)
         parser.add_argument("--loss_recss_coef", default=0, type=float)
-        parser.add_argument("--loss_recss_complementary_coef", default=0.0, type=float,
-                            help="weight for complementary learning over rec_ss negative candidates")
+
+        # FW-CDL:
+        # Forward word-level complementary learning
+        parser.add_argument("--fw_cdl_tau", default=0.07, type=float,
+                            help="temperature for FW-CDL teacher and student distributions")
+        parser.add_argument("--fw_cdl_coef", default=0.1, type=float,
+                            help="weight for forward word-level complementary learning")
         parser.add_argument("--iou_gamma", default=0.9, type=float)
         parser.add_argument("--recss_tau", default=0.5, type=float)
-        parser.add_argument("--recss_comp_tau_d", default=0.2, type=float,
-                            help="temperature for temporal/semantic dissimilarity targets")
-        parser.add_argument("--recss_comp_tau_s", default=1.0, type=float,
-                            help="temperature for negated rec_ss similarity scores")
-        parser.add_argument("--recss_comp_temporal_weight", default=0.5, type=float,
-                            help="temporal weight in the mixed dissimilarity target; semantic uses 1-weight")
 
         ## train
         parser.add_argument("--exp_id", type=str, default=None,

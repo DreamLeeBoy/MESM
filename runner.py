@@ -16,6 +16,10 @@ from model import PositionEmbeddingSine, TrainablePositionalEncoding
 from model import MESM, HungarianMatcher, Criterion
 from model import convert_weights
 
+# FW-CDL:
+# Forward word-level complementary learning
+from utils.word_pos import POS_TO_ID, normalize_pos_word, word_to_pos
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(asctime)s.%(msecs)03d:%(levelname)s:%(name)s - %(message)s",
@@ -305,6 +309,96 @@ def build_model(args, vocab=None):
     return model
 
 
+# FW-CDL:
+# Forward word-level complementary learning
+def build_fw_cdl_resources(model, tokenizer):
+    """Align offline POS labels and frozen text features to FW class IDs."""
+    if not model.rec_fw:
+        return None, None
+
+    num_classes = model.output_txt_proj[-1].out_features
+    id2label = tokenizer.id2label
+
+    if isinstance(model.text_encoder, CLIPTextEncoder):
+        frozen_features = model.text_encoder.token_embedding.weight.detach()
+        feature_dim = frozen_features.size(-1)
+        class_features = torch.zeros(
+            num_classes,
+            feature_dim,
+            device=frozen_features.device,
+            dtype=torch.float32,
+        )
+
+        # FW-CDL:
+        # Forward word-level complementary learning
+        def resolve_word_feature(source_id):
+            if not isinstance(source_id, int):
+                return None, None
+            token_surface = tokenizer.decoder.get(source_id, "")
+            if not token_surface.endswith("</w>"):
+                return None, None
+            return tokenizer.decode([source_id]).strip(), frozen_features[source_id]
+
+    elif isinstance(model.text_encoder, GloveTextEncoder):
+        frozen_features = model.text_encoder.emb.weight.detach()
+        feature_dim = frozen_features.size(-1)
+        class_features = torch.zeros(
+            num_classes,
+            feature_dim,
+            device=frozen_features.device,
+            dtype=torch.float32,
+        )
+
+        # FW-CDL:
+        # Forward word-level complementary learning
+        def resolve_word_feature(source_id):
+            if not isinstance(source_id, int):
+                return None, None
+            return tokenizer.vocab.itow.get(source_id), frozen_features[source_id]
+
+    else:
+        vocab = tokenizer.vocab
+        feature_dim = int(torch.as_tensor(vocab["id2vec"][0]).numel())
+        class_features = torch.zeros(num_classes, feature_dim, dtype=torch.float32)
+
+        # FW-CDL:
+        # Forward word-level complementary learning
+        def resolve_word_feature(source_word):
+            if not isinstance(source_word, str) or source_word not in vocab["w2id"]:
+                return None, None
+            feature = vocab["id2vec"][vocab["w2id"][source_word]]
+            return source_word, torch.as_tensor(feature, dtype=torch.float32)
+
+    class_pos = torch.full((num_classes,), -1, dtype=torch.long)
+    for source_id, class_id in id2label.items():
+        if not isinstance(class_id, int) or not 0 <= class_id < num_classes:
+            continue
+        surface, feature = resolve_word_feature(source_id)
+        if surface is None or feature is None:
+            continue
+        pos_name = word_to_pos.get(normalize_pos_word(surface))
+        if pos_name is None:
+            continue
+        feature = feature.detach().to(device=class_features.device, dtype=torch.float32)
+        class_pos[class_id] = POS_TO_ID[pos_name]
+        class_features[class_id] = feature
+
+    # FW-CDL:
+    # Forward word-level complementary learning
+    valid_features = (
+        torch.isfinite(class_features).all(dim=-1)
+        & class_features.norm(dim=-1).gt(0)
+    ).cpu()
+    class_pos[~valid_features] = -1
+    mapped_classes = int((class_pos >= 0).sum())
+    logger.info(
+        "FW-CDL loaded offline POS/frozen-feature metadata for %d/%d FW classes",
+        mapped_classes,
+        num_classes,
+    )
+    return class_pos, class_features.detach()
+
+
 def build_matcher(args):
     return HungarianMatcher(
         cost_span=args.set_cost_span, cost_giou=args.set_cost_giou,
@@ -313,24 +407,28 @@ def build_matcher(args):
     )
 
 
-def build_criterion(args):
+def build_criterion(args, model=None, tokenizer=None):
     logger.info("Building criterion...")
     matcher = build_matcher(args)
-    recss_complementary_coef = getattr(args, "loss_recss_complementary_coef", 0.0)
-    if not (
-        math.isfinite(float(recss_complementary_coef))
-        and recss_complementary_coef >= 0
-    ):
-        raise ValueError(
-            "loss_recss_complementary_coef must be finite and non-negative"
+
+    # FW-CDL:
+    # Forward word-level complementary learning
+    fw_cdl_coef = float(getattr(args, "fw_cdl_coef", 0.1))
+    fw_cdl_tau = float(getattr(args, "fw_cdl_tau", 0.07))
+    if not math.isfinite(fw_cdl_coef) or fw_cdl_coef < 0:
+        raise ValueError("fw_cdl_coef must be finite and non-negative")
+    if not math.isfinite(fw_cdl_tau) or fw_cdl_tau <= 0:
+        raise ValueError("fw_cdl_tau must be finite and positive")
+    fw_cdl_class_pos = None
+    fw_cdl_class_features = None
+    if args.rec_fw and fw_cdl_coef > 0 and model is not None and tokenizer is not None:
+        fw_cdl_class_pos, fw_cdl_class_features = build_fw_cdl_resources(
+            model, tokenizer
         )
-    recss_coef = float(args.loss_recss_coef)
-    if recss_complementary_coef > 0 and (
-        not args.rec_ss or not math.isfinite(recss_coef) or recss_coef <= 0
-    ):
-        raise ValueError(
-            "loss_recss_complementary_coef > 0 requires rec_ss=True "
-            "and a finite loss_recss_coef > 0"
+    elif args.rec_fw and fw_cdl_coef > 0:
+        logger.warning(
+            "FW-CDL is disabled because frozen class metadata requires both "
+            "the model and training tokenizer"
         )
 
     losses = ['span', 'label', 'saliency']
@@ -351,13 +449,16 @@ def build_criterion(args):
     if args.rec_fw:
         losses.append("rec_fw")
         weight_dict["loss_rec_fw"] = args.loss_recfw_coef
+
+        # FW-CDL:
+        # Forward word-level complementary learning
+        if fw_cdl_coef > 0 and fw_cdl_class_pos is not None:
+            losses.append("fw_cdl")
+            weight_dict["loss_fw_cdl"] = fw_cdl_coef
     
     if args.rec_ss:
         losses.append("rec_ss")
         weight_dict["loss_rec_ss"] = args.loss_recss_coef
-        if recss_complementary_coef > 0:
-            losses.append("rec_ss_complementary")
-            weight_dict["loss_rec_ss_complementary"] = recss_complementary_coef
 
     criterion = Criterion(
         matcher=matcher, weight_dict=weight_dict, losses=losses,
@@ -370,11 +471,11 @@ def build_criterion(args):
         multi_clip=args.dataset_name in ["qvhighlights"],
         gamma=args.iou_gamma,
         recss_tau=args.recss_tau,
-        recss_comp_tau_d=getattr(args, "recss_comp_tau_d", 0.2),
-        recss_comp_tau_s=getattr(args, "recss_comp_tau_s", 1.0),
-        recss_comp_temporal_weight=getattr(
-            args, "recss_comp_temporal_weight", 0.5
-        ),
+        # FW-CDL:
+        # Forward word-level complementary learning
+        fw_cdl_tau=fw_cdl_tau,
+        fw_cdl_class_pos=fw_cdl_class_pos,
+        fw_cdl_class_features=fw_cdl_class_features,
     )
     criterion.to(args.device)
     return criterion
