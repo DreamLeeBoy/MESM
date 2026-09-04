@@ -6,59 +6,108 @@ import torch.nn.functional as F
 import torch.fft as fft
 from torch.distributions.normal import Normal
 
+# Vectorization notes:
+# 1) multi-kernel trend decomposition uses one cumulative-sum pipeline;
+# 2) factorized WeightGenerator batches all requested matrices/biases;
+# 3) Transformer_Layer already folds patch index into batch dimension;
+# 4) the outer AMS expert loop is intentionally retained because experts
+#    have heterogeneous patch sizes/parameter shapes and sparse top-k routing.
+
+
 
 class SparseDispatcher(object):
     """
-    Mostly follows Pathformer / sparsely-gated MoE dispatcher.
-    It dispatches samples to selected experts according to non-zero gates,
-    then combines expert outputs with gate weights.
+    GPU-friendlier sparse dispatcher.
+
+    Keeps the original sparse top-k routing semantics, while:
+      - calling nonzero() only once
+      - sorting routes once
+      - avoiding einsum for scalar gate multiplication
+      - avoiding requires_grad=True on the zero accumulation tensor
+
+    torch.split() still requires Python split sizes, so one small
+    GPU->CPU synchronization remains here.
     """
     def __init__(self, num_experts, gates):
         self._gates = gates
         self._num_experts = num_experts
 
-        sorted_experts, index_sorted_experts = torch.nonzero(gates).sort(0)
-        _, self._expert_index = sorted_experts.split(1, dim=1)
+        # [num_routes, 2] -> (batch_id, expert_id)
+        routes = torch.nonzero(
+            gates,
+            as_tuple=False
+        )
 
-        self._batch_index = torch.nonzero(gates)[index_sorted_experts[:, 1], 0]
-        self._part_sizes = (gates > 0).sum(0).tolist()
+        # Group routes by expert.
+        order = torch.argsort(routes[:, 1])
+        routes = routes.index_select(0, order)
 
-        gates_exp = gates[self._batch_index.flatten()]
-        self._nonzero_gates = torch.gather(gates_exp, 1, self._expert_index)
+        self._batch_index = routes[:, 0]
+        self._expert_index = routes[:, 1:2]
+
+        # torch.split currently needs host-side integer sizes.
+        counts = torch.bincount(
+            routes[:, 1],
+            minlength=num_experts
+        )
+        self._part_sizes = counts.tolist()
+
+        # One scalar gate for each routed sample.
+        self._nonzero_gates = gates[
+            self._batch_index,
+            self._expert_index.squeeze(1)
+        ].unsqueeze(1)
 
     def dispatch(self, inp):
-        inp_exp = inp[self._batch_index].squeeze(1)
-        return torch.split(inp_exp, self._part_sizes, dim=0)
+        routed = inp.index_select(
+            0,
+            self._batch_index
+        )
+
+        return torch.split(
+            routed,
+            self._part_sizes,
+            dim=0
+        )
 
     def combine(self, expert_out, multiply_by_gates=True):
         if len(expert_out) == 0:
-            raise RuntimeError("SparseDispatcher received no expert outputs.")
-
-        stitched = torch.cat(expert_out, 0)
-
-        if multiply_by_gates:
-            stitched = torch.einsum(
-                "b t n d, b e -> b t n d",
-                stitched,
-                self._nonzero_gates
+            raise RuntimeError(
+                "SparseDispatcher received no expert outputs."
             )
 
-        zeros = torch.zeros(
-            self._gates.size(0),
-            expert_out[-1].size(1),
-            expert_out[-1].size(2),
-            expert_out[-1].size(3),
-            requires_grad=True,
-            device=stitched.device,
-            dtype=stitched.dtype,
+        stitched = torch.cat(
+            expert_out,
+            dim=0
         )
 
-        combined = zeros.index_add(0, self._batch_index, stitched)
-        return combined
+        if multiply_by_gates:
+            gate = self._nonzero_gates.view(
+                -1, 1, 1, 1
+            )
+            stitched = stitched * gate
+
+        output = stitched.new_zeros(
+            self._gates.size(0),
+            stitched.size(1),
+            stitched.size(2),
+            stitched.size(3),
+        )
+
+        output = output.index_add(
+            0,
+            self._batch_index,
+            stitched
+        )
+
+        return output
 
     def expert_to_gates(self):
-        return torch.split(self._nonzero_gates, self._part_sizes, dim=0)
-
+        return torch.split(
+            self._nonzero_gates,
+            self._part_sizes,
+            dim=0
+        )
 
 class moving_avg(nn.Module):
     def __init__(self, kernel_size, stride):
@@ -85,33 +134,162 @@ class moving_avg(nn.Module):
 
 class series_decomp_multi(nn.Module):
     """
-    Multi-kernel moving average trend decomposition from Pathformer.
+    Vectorized multi-kernel moving-average trend decomposition.
+
+    The original Pathformer implementation evaluates one AvgPool1d module
+    per kernel. Here all moving-average windows are computed together from
+    one replicate-padded cumulative sum.
+
+    Input:
+        x: [B, L, C]
+
+    Output:
+        res:         [B, L, C]
+        moving_mean: [B, L, C]
+
+    This preserves the original asymmetric endpoint replication:
+        left_pad  = kernel // 2
+        right_pad = (kernel - 1) // 2
     """
     def __init__(self, kernel_size):
         super(series_decomp_multi, self).__init__()
-        self.moving_avg = nn.ModuleList([
-            moving_avg(kernel, stride=1) for kernel in kernel_size
-        ])
-        self.layer = nn.Linear(1, len(kernel_size))
+
+        if len(kernel_size) == 0:
+            raise ValueError("kernel_size must contain at least one kernel.")
+
+        kernels = tuple(int(k) for k in kernel_size)
+        if any(k <= 0 for k in kernels):
+            raise ValueError(f"All moving-average kernels must be positive, got {kernels}.")
+
+        self.kernel_size = kernels
+        self.num_kernels = len(kernels)
+        self.max_left_pad = max(k // 2 for k in kernels)
+        self.max_right_pad = max((k - 1) // 2 for k in kernels)
+
+        # Non-persistent because these values are structural constants and
+        # should not change existing checkpoint state_dict compatibility.
+        self.register_buffer(
+            "_kernels",
+            torch.tensor(kernels, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_left_pad",
+            torch.tensor([k // 2 for k in kernels], dtype=torch.long),
+            persistent=False,
+        )
+
+        self.layer = nn.Linear(1, self.num_kernels)
 
     def forward(self, x):
-        moving_mean = []
-        for func in self.moving_avg:
-            moving_mean.append(func(x).unsqueeze(-1))
+        if x.dim() != 3:
+            raise ValueError(
+                f"series_decomp_multi expects [B, L, C], got {tuple(x.shape)}"
+            )
 
-        moving_mean = torch.cat(moving_mean, dim=-1)
-        weights = nn.Softmax(-1)(self.layer(x.unsqueeze(-1)))
-        moving_mean = torch.sum(moving_mean * weights, dim=-1)
+        batch_size, seq_len, channels = x.shape
+
+        # [B, L, C] -> [B, C, L]
+        x_t = x.transpose(1, 2)
+
+        # One common replicate padding for every kernel.
+        # Each individual kernel uses an offset inside this common padded
+        # sequence so that its result is exactly aligned with the original
+        # moving_avg implementation.
+        x_pad = F.pad(
+            x_t,
+            (self.max_left_pad, self.max_right_pad),
+            mode="replicate",
+        )
+
+        # Prefix sums with an explicit zero at index 0.
+        # Shape: [B, C, L_pad + 1]
+        prefix = F.pad(
+            x_pad.cumsum(dim=-1),
+            (1, 0),
+            mode="constant",
+            value=0.0,
+        )
+
+        kernels = self._kernels.to(device=x.device)
+        left_pad = self._left_pad.to(device=x.device)
+
+        # For kernel k, original moving_avg uses left padding k//2.
+        # Since x_pad uses max_left_pad for every kernel, shift each window
+        # start by (max_left_pad - k//2).
+        positions = torch.arange(seq_len, device=x.device)
+        starts = (
+            (self.max_left_pad - left_pad).unsqueeze(1)
+            + positions.unsqueeze(0)
+        )
+        ends = starts + kernels.unsqueeze(1)
+
+        # Gather every kernel/window in one tensorized operation.
+        # prefix_expanded is a view; expand does not materialize copies.
+        prefix_expanded = prefix.unsqueeze(2).expand(
+            batch_size,
+            channels,
+            self.num_kernels,
+            -1,
+        )
+
+        gather_shape = (
+            batch_size,
+            channels,
+            self.num_kernels,
+            seq_len,
+        )
+        start_idx = starts.view(
+            1, 1, self.num_kernels, seq_len
+        ).expand(gather_shape)
+        end_idx = ends.view(
+            1, 1, self.num_kernels, seq_len
+        ).expand(gather_shape)
+
+        window_sum = (
+            torch.gather(prefix_expanded, dim=-1, index=end_idx)
+            - torch.gather(prefix_expanded, dim=-1, index=start_idx)
+        )
+
+        kernel_scale = kernels.to(
+            device=x.device,
+            dtype=x.dtype,
+        ).view(1, 1, self.num_kernels, 1)
+
+        # [B, C, K, L] -> [B, L, C, K]
+        moving_mean_all = (
+            window_sum / kernel_scale
+        ).permute(0, 3, 1, 2)
+
+        weights = F.softmax(
+            self.layer(x.unsqueeze(-1)),
+            dim=-1,
+        )
+
+        moving_mean = torch.sum(
+            moving_mean_all * weights,
+            dim=-1,
+        )
 
         res = x - moving_mean
         return res, moving_mean
 
 
+
 class FourierLayer(nn.Module):
     """
-    Fourier seasonality extraction from Pathformer.
+    Fourier seasonality extraction.
+
+    Optimized version avoids building meshgrid index tensors on
+    every forward pass and uses gather() directly.
     """
-    def __init__(self, pred_len, k=None, low_freq=1, output_attention=False):
+    def __init__(
+        self,
+        pred_len,
+        k=None,
+        low_freq=1,
+        output_attention=False
+    ):
         super().__init__()
         self.pred_len = pred_len
         self.k = k
@@ -120,44 +298,42 @@ class FourierLayer(nn.Module):
 
     def forward(self, x):
         b, t, d = x.shape
-        x_freq = fft.rfft(x, dim=1)
+
+        x_freq = fft.rfft(
+            x,
+            dim=1
+        )
+
+        full_f = fft.rfftfreq(
+            t,
+            device=x.device
+        )
 
         if t % 2 == 0:
-            x_freq = x_freq[:, self.low_freq:-1]
-            f = fft.rfftfreq(t, device=x.device)[self.low_freq:-1]
+            x_freq = x_freq[
+                :,
+                self.low_freq:-1
+            ]
+            f = full_f[
+                self.low_freq:-1
+            ]
         else:
-            x_freq = x_freq[:, self.low_freq:]
-            f = fft.rfftfreq(t, device=x.device)[self.low_freq:]
+            x_freq = x_freq[
+                :,
+                self.low_freq:
+            ]
+            f = full_f[
+                self.low_freq:
+            ]
 
-        x_freq, index_tuple = self.topk_freq(x_freq)
-
-        f = f.unsqueeze(0).unsqueeze(-1).repeat(b, 1, d)
-        f = f[index_tuple]
-        f = f.unsqueeze(2)
-
-        return self.extrapolate(x_freq, f, t), None
-
-    def extrapolate(self, x_freq, f, t):
-        x_freq = torch.cat([x_freq, x_freq.conj()], dim=1)
-        f = torch.cat([f, -f], dim=1)
-
-        t_val = torch.arange(
-            t + self.pred_len,
-            dtype=torch.float,
-            device=x_freq.device
-        ).view(1, 1, -1, 1)
-
-        amp = x_freq.abs().unsqueeze(2) / t
-        phase = x_freq.angle().unsqueeze(2)
-
-        x_time = amp * torch.cos(2 * math.pi * f * t_val + phase)
-        return x_time.sum(dim=1)
-
-    def topk_freq(self, x_freq):
         k = self.k
         if k is None:
             k = x_freq.shape[1]
-        k = min(k, x_freq.shape[1])
+
+        k = min(
+            k,
+            x_freq.shape[1]
+        )
 
         _, indices = torch.topk(
             x_freq.abs(),
@@ -167,21 +343,60 @@ class FourierLayer(nn.Module):
             sorted=True
         )
 
-        mesh_a, mesh_b = torch.meshgrid(
-            torch.arange(x_freq.size(0), device=x_freq.device),
-            torch.arange(x_freq.size(2), device=x_freq.device),
-            indexing="ij"
+        # [B, k, D]
+        x_freq = torch.gather(
+            x_freq,
+            dim=1,
+            index=indices
         )
 
-        index_tuple = (
-            mesh_a.unsqueeze(1),
-            indices,
-            mesh_b.unsqueeze(1)
+        # Frequency grid [B, F, D], then gather using
+        # exactly the same top-k indices.
+        f_grid = f.view(
+            1, -1, 1
+        ).expand(
+            b, -1, d
         )
 
-        x_freq = x_freq[index_tuple]
-        return x_freq, index_tuple
+        f = torch.gather(
+            f_grid,
+            dim=1,
+            index=indices
+        ).unsqueeze(2)
 
+        return self.extrapolate(
+            x_freq,
+            f,
+            t
+        ), None
+
+    def extrapolate(self, x_freq, f, t):
+        x_freq = torch.cat(
+            [x_freq, x_freq.conj()],
+            dim=1
+        )
+
+        f = torch.cat(
+            [f, -f],
+            dim=1
+        )
+
+        t_val = torch.arange(
+            t + self.pred_len,
+            dtype=torch.float,
+            device=x_freq.device
+        ).view(
+            1, 1, -1, 1
+        )
+
+        amp = x_freq.abs().unsqueeze(2) / t
+        phase = x_freq.angle().unsqueeze(2)
+
+        x_time = amp * torch.cos(
+            2 * math.pi * f * t_val + phase
+        )
+
+        return x_time.sum(dim=1)
 
 class CustomLinear(nn.Module):
     def __init__(self, factorized):
@@ -197,8 +412,12 @@ class CustomLinear(nn.Module):
 
 class WeightGenerator(nn.Module):
     """
-    Pathformer dynamic/factorized weight generator.
-    Only change: remove .to('cpu') so parameters follow model.to(device).
+    Vectorized Pathformer dynamic/factorized weight generator.
+
+    ParameterList layout is intentionally preserved so checkpoints produced
+    by the previous implementation remain loadable. The forward path stacks
+    P/Q/B once and generates all dynamic weights/biases in batched tensor
+    operations instead of one Python matmul chain per requested weight.
     """
     def __init__(self, in_dim, out_dim, mem_dim, num_nodes, factorized, number_of_weights=4):
         super(WeightGenerator, self).__init__()
@@ -262,63 +481,192 @@ class WeightGenerator(nn.Module):
                 nn.init.uniform_(self.B[i], -bound, bound)
 
     def forward(self):
-        if self.factorized:
-            memory = self.generator(self.memory.unsqueeze(1))
-            bias = [
-                torch.matmul(memory, self.B[i]).squeeze(1)
-                for i in range(self.number_of_weights)
-            ]
-
-            memory = memory.view(self.num_nodes, self.mem_dim, self.mem_dim)
-            weights = [
-                torch.matmul(torch.matmul(self.P[i], memory), self.Q[i])
-                for i in range(self.number_of_weights)
-            ]
-
-            return weights, bias
-        else:
+        if not self.factorized:
             return self.P, self.B
+
+        # Generator output:
+        # [N, mem_dim_in] -> [N, 100] -> [N, 10, 10]
+        memory_flat = self.generator(
+            self.memory.unsqueeze(1)
+        ).squeeze(1)
+
+        memory = memory_flat.view(
+            self.num_nodes,
+            self.mem_dim,
+            self.mem_dim,
+        )
+
+        # Preserve ParameterList names/state_dict, but batch the actual math.
+        # P: [W, I, M]
+        # Q: [W, M, O]
+        # B: [W, M*M, O]
+        P = torch.stack(tuple(self.P), dim=0)
+        Q = torch.stack(tuple(self.Q), dim=0)
+        B = torch.stack(tuple(self.B), dim=0)
+
+        # All W dynamic matrices at once:
+        #   P_w @ Memory_n @ Q_w
+        # -> [W, N, I, O]
+        weights = torch.einsum(
+            "wim,nmk,wko->wnio",
+            P,
+            memory,
+            Q,
+        )
+
+        # All W dynamic biases at once:
+        # [N, M*M] x [W, M*M, O] -> [W, N, O]
+        bias = torch.einsum(
+            "nm,wmo->wno",
+            memory_flat,
+            B,
+        )
+
+        # Existing callers use weights_distinct[i]/biases_distinct[i].
+        # Returning tuples of tensor views keeps that interface unchanged.
+        return weights.unbind(0), bias.unbind(0)
+
 
 
 class Intra_Patch_Attention(nn.Module):
     def __init__(self, d_model, factorized):
         super(Intra_Patch_Attention, self).__init__()
+
         self.head = 2
 
         if d_model % self.head != 0:
-            raise ValueError("Hidden size is not divisible by the number of attention heads.")
+            raise ValueError(
+                "Hidden size is not divisible by "
+                "the number of attention heads."
+            )
 
-        self.head_size = int(d_model // self.head)
-        self.custom_linear = CustomLinear(factorized)
+        self.head_size = d_model // self.head
+        self.custom_linear = CustomLinear(
+            factorized
+        )
 
-    def forward(self, query, key, value, weights_distinct, biases_distinct, weights_shared, biases_shared):
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        weights_distinct,
+        biases_distinct,
+        weights_shared,
+        biases_shared
+    ):
+        """
+        Shapes:
+          query: [B, Lq, N, D]
+          key:   [B, Lk, N, D]
+          value: [B, Lk, N, D]
+
+        The original implementation used split()+cat() to move the
+        two attention heads into the batch dimension. reshape/permute
+        does the same operation without allocating those temporary
+        concatenations.
+        """
         batch_size = query.shape[0]
+        q_len = query.shape[1]
+        k_len = key.shape[1]
+        n_nodes = query.shape[2]
 
-        key = self.custom_linear(key, weights_distinct[0], biases_distinct[0])
-        value = self.custom_linear(value, weights_distinct[1], biases_distinct[1])
+        key = self.custom_linear(
+            key,
+            weights_distinct[0],
+            biases_distinct[0]
+        )
 
-        query = torch.cat(torch.split(query, self.head_size, dim=-1), dim=0)
-        key = torch.cat(torch.split(key, self.head_size, dim=-1), dim=0)
-        value = torch.cat(torch.split(value, self.head_size, dim=-1), dim=0)
+        value = self.custom_linear(
+            value,
+            weights_distinct[1],
+            biases_distinct[1]
+        )
 
-        query = query.permute((0, 2, 1, 3))
-        key = key.permute((0, 2, 3, 1))
-        value = value.permute((0, 2, 1, 3))
+        h = self.head
+        hd = self.head_size
 
-        attention = torch.matmul(query, key)
-        attention /= self.head_size ** 0.5
-        attention = torch.softmax(attention, dim=-1)
+        # [B, H, N, Lq, Hd]
+        query = query.reshape(
+            batch_size,
+            q_len,
+            n_nodes,
+            h,
+            hd
+        ).permute(
+            0, 3, 2, 1, 4
+        )
 
-        x = torch.matmul(attention, value)
-        x = x.permute((0, 2, 1, 3))
-        x = torch.cat(torch.split(x, batch_size, dim=0), dim=-1)
+        # [B, H, N, Hd, Lk]
+        key = key.reshape(
+            batch_size,
+            k_len,
+            n_nodes,
+            h,
+            hd
+        ).permute(
+            0, 3, 2, 4, 1
+        )
 
-        x = self.custom_linear(x, weights_shared[0], biases_shared[0])
-        x = torch.relu(x)
-        x = self.custom_linear(x, weights_shared[1], biases_shared[1])
+        # [B, H, N, Lk, Hd]
+        value = value.reshape(
+            batch_size,
+            k_len,
+            n_nodes,
+            h,
+            hd
+        ).permute(
+            0, 3, 2, 1, 4
+        )
+
+        attention = torch.matmul(
+            query,
+            key
+        )
+
+        attention = attention * (
+            hd ** -0.5
+        )
+
+        attention = F.softmax(
+            attention,
+            dim=-1
+        )
+
+        # [B, H, N, Lq, Hd]
+        x = torch.matmul(
+            attention,
+            value
+        )
+
+        # -> [B, Lq, N, D]
+        x = x.permute(
+            0, 3, 2, 1, 4
+        ).contiguous().reshape(
+            batch_size,
+            q_len,
+            n_nodes,
+            h * hd
+        )
+
+        x = self.custom_linear(
+            x,
+            weights_shared[0],
+            biases_shared[0]
+        )
+
+        x = F.relu(
+            x,
+            inplace=False
+        )
+
+        x = self.custom_linear(
+            x,
+            weights_shared[1],
+            biases_shared[1]
+        )
 
         return x, attention
-
 
 class ScaledDotProductAttention(nn.Module):
     def __init__(self, d_model, n_heads, attn_dropout=0., res_attention=False, lsa=False):
@@ -543,87 +891,263 @@ class Transformer_Layer(nn.Module):
             nn.Linear(self.d_ff, self.d_model, bias=True)
         )
 
+
     def forward(self, x):
+        """
+        Vectorized Pathformer expert.
+
+        Original code launched intra-patch attention once per patch.
+        With L=600:
+          patch=3  -> 200 Python/CUDA launches
+          patch=5  -> 120
+          patch=15 -> 40
+
+        Here the patch dimension is folded into the batch dimension,
+        so one expert performs intra-patch attention in one batched
+        operation.
+        """
         new_x = x
+
         batch_size = x.size(0)
-        intra_out_concat = None
+        seq_len = x.size(1)
+        num_nodes = x.size(2)
+        d_model = x.size(3)
 
-        weights_shared, biases_shared = self.weights_generator_shared()
-        weights_distinct, biases_distinct = self.weights_generator_distinct()
+        expected_len = (
+            self.patch_nums
+            * self.patch_size
+        )
 
-        for i in range(self.patch_nums):
-            t = x[:, i * self.patch_size:(i + 1) * self.patch_size, :, :]
+        if seq_len != expected_len:
+            raise ValueError(
+                f"Transformer_Layer expected temporal "
+                f"length {expected_len}, got {seq_len}"
+            )
 
-            intra_emb = self.embeddings_generator[i](
-                self.intra_embeddings[i]
-            ).expand(batch_size, -1, -1, -1)
+        weights_shared, biases_shared = (
+            self.weights_generator_shared()
+        )
 
-            t = torch.cat([intra_emb, t], dim=1)
+        weights_distinct, biases_distinct = (
+            self.weights_generator_distinct()
+        )
 
-            out, attention = self.intra_patch_attention(
-                intra_emb,
-                t,
-                t,
+        # ----------------------------------------------------
+        # Vectorized intra-patch embeddings.
+        #
+        # Original:
+        #   for i in range(patch_nums):
+        #       embeddings_generator[i](
+        #           intra_embeddings[i]
+        #       )
+        #
+        # Keep the original Parameter/ModuleList layout for
+        # checkpoint compatibility, but stack their parameters
+        # and evaluate all patch embeddings together.
+        # ----------------------------------------------------
+
+        embed_input = self.intra_embeddings[
+            :, 0, 0, :, :
+        ]
+        # [P, N, 16]
+
+        embed_weights = torch.stack(
+            [
+                module[0].weight
+                for module
+                in self.embeddings_generator
+            ],
+            dim=0
+        )
+        # [P, D, 16]
+
+        embed_bias = torch.stack(
+            [
+                module[0].bias
+                for module
+                in self.embeddings_generator
+            ],
+            dim=0
+        )
+        # [P, D]
+
+        patch_embeddings = torch.einsum(
+            "pni,pdi->pnd",
+            embed_input,
+            embed_weights
+        )
+
+        patch_embeddings = (
+            patch_embeddings
+            + embed_bias[:, None, :]
+        )
+        # [P, N, D]
+
+        patch_embeddings = (
+            patch_embeddings
+            .unsqueeze(0)
+            .expand(
+                batch_size,
+                -1,
+                -1,
+                -1
+            )
+        )
+        # [B, P, N, D]
+
+        # ----------------------------------------------------
+        # [B, L, N, D]
+        # -> [B, P, S, N, D]
+        # ----------------------------------------------------
+
+        patches = x.reshape(
+            batch_size,
+            self.patch_nums,
+            self.patch_size,
+            num_nodes,
+            d_model
+        )
+
+        # Query:
+        # [B*P, 1, N, D]
+        intra_query = (
+            patch_embeddings
+            .reshape(
+                batch_size
+                * self.patch_nums,
+                num_nodes,
+                d_model
+            )
+            .unsqueeze(1)
+        )
+
+        # Key/value:
+        # prepend one learned embedding to every patch.
+        intra_kv = torch.cat(
+            [
+                patch_embeddings.unsqueeze(2),
+                patches
+            ],
+            dim=2
+        )
+
+        intra_kv = intra_kv.reshape(
+            batch_size * self.patch_nums,
+            self.patch_size + 1,
+            num_nodes,
+            d_model
+        )
+
+        intra_out, intra_attention = (
+            self.intra_patch_attention(
+                intra_query,
+                intra_kv,
+                intra_kv,
                 weights_distinct,
                 biases_distinct,
                 weights_shared,
                 biases_shared
             )
-
-            if intra_out_concat is None:
-                intra_out_concat = out
-            else:
-                intra_out_concat = torch.cat([intra_out_concat, out], dim=1)
-
-        intra_out_concat = intra_out_concat.permute(0, 3, 2, 1)
-        intra_out_concat = self.intra_Linear(intra_out_concat)
-        intra_out_concat = intra_out_concat.permute(0, 3, 2, 1)
-
-        x = x.unfold(
-            dimension=1,
-            size=self.patch_size,
-            step=self.stride
         )
 
-        x = x.permute(0, 2, 1, 3, 4)
-
-        b, nvar, patch_num, dim, patch_len = x.shape
-
-        x = torch.reshape(
-            x,
-            (
-                x.shape[0] * x.shape[1],
-                x.shape[2],
-                x.shape[3] * x.shape[-1]
+        # [B*P,1,N,D] -> [B,P,N,D]
+        intra_out_concat = (
+            intra_out
+            .squeeze(1)
+            .reshape(
+                batch_size,
+                self.patch_nums,
+                num_nodes,
+                d_model
             )
         )
 
-        x = self.emb_linear(x)
-        x = self.dropout(x + self.W_pos)
-
-        inter_out, attention = self.inter_patch_attention(Q=x, K=x, V=x)
-
-        inter_out = torch.reshape(
-            inter_out,
-            (b, nvar, inter_out.shape[-2], inter_out.shape[-1])
+        # Same projection as original implementation:
+        # [B,P,N,D] -> [B,L,N,D]
+        intra_out_concat = (
+            intra_out_concat.permute(
+                0, 3, 2, 1
+            )
         )
 
-        inter_out = torch.reshape(
-            inter_out,
-            (b, nvar, inter_out.shape[-2], self.patch_size, self.d_model)
+        intra_out_concat = (
+            self.intra_Linear(
+                intra_out_concat
+            )
         )
 
-        inter_out = torch.reshape(
-            inter_out,
-            (b, self.patch_size * self.patch_nums, nvar, self.d_model)
+        intra_out_concat = (
+            intra_out_concat.permute(
+                0, 3, 2, 1
+            )
         )
 
-        out = new_x + intra_out_concat + inter_out
-        out = self.dropout(out)
-        out = self.ff(out) + out
+        # ----------------------------------------------------
+        # Inter-patch path.
+        #
+        # Avoid unfold() and construct the same D*S ordering
+        # directly from the existing patch view.
+        # ----------------------------------------------------
 
-        return out, attention
+        inter_x = patches.permute(
+            0, 3, 1, 4, 2
+        )
+        # [B, N, P, D, S]
 
+        inter_x = inter_x.reshape(
+            batch_size * num_nodes,
+            self.patch_nums,
+            d_model * self.patch_size
+        )
+
+        inter_x = self.emb_linear(
+            inter_x
+        )
+
+        inter_x = self.dropout(
+            inter_x + self.W_pos
+        )
+
+        inter_out, inter_attention = (
+            self.inter_patch_attention(
+                Q=inter_x,
+                K=inter_x,
+                V=inter_x
+            )
+        )
+
+        inter_out = inter_out.reshape(
+            batch_size,
+            num_nodes,
+            self.patch_nums,
+            self.patch_size,
+            d_model
+        )
+
+        # Preserve the ORIGINAL Pathformer memory layout exactly.
+        # Do NOT permute here.
+        inter_out = inter_out.reshape(
+            batch_size,
+            self.patch_size * self.patch_nums,
+            num_nodes,
+            d_model
+        )
+
+        out = (
+            new_x
+            + intra_out_concat
+            + inter_out
+        )
+
+        out = self.dropout(
+            out
+        )
+
+        out = self.ff(
+            out
+        ) + out
+
+        return out, inter_attention
 
 class AMS(nn.Module):
     """
@@ -770,7 +1294,7 @@ class AMS(nn.Module):
         top_k_indices = top_indices[:, :self.k]
         top_k_gates = self.softmax(top_k_logits)
 
-        zeros = torch.zeros_like(logits, requires_grad=True)
+        zeros = torch.zeros_like(logits)
         gates = zeros.scatter(1, top_k_indices, top_k_gates)
 
         if self.noisy_gating and self.k < self.num_experts and train:

@@ -5,6 +5,8 @@ import pprint
 import random
 import torch
 import logging
+
+# RTX 30/Ampere acceleration
 import numpy as np
 import torch.backends.cudnn as cudnn
 from torch import nn

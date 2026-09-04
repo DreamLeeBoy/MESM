@@ -1,8 +1,8 @@
 {
     "is_inference": true,
     "inference_id": "VGG_GloVe",
-    "inference_result_dir": "./results/eval",
-    "trained_result_dir": "./trained_results/charades-VGG_GloVe",
+    "inference_result_dir": "./results/ambedy2/VGG/eval",
+    "trained_result_dir": "./results/ambedy2/VGG/train/charades/charades-VGG_GloVe-2026_09_03_20_35_01",
 
     "num_workers": 8,
     "nms_thd": -1,

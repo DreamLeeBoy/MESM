@@ -1,24 +1,16 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-REPO_DIR="${HOME}/MESM_clone"
+REPO_DIR="/root/autodl-tmp/MESM"
 GPU_ID="${1:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 CONFIGS=(
-  "config/charades/C+SF_C.json"
-  "config/charades/VGG_GloVe.json"
-  "config/Charades-CG/C+SF_C.json"
-  "config/QVHighlights/C+SF_C.json"
-  "config/TACoS/C3D_GloVe.json"
+  "config/charades/VGG_GloVe-ambedy2.json"
 )
 
 NAMES=(
-  "charades_C+SF_C"
-  "charades_VGG_GloVe"
-  "charades_cg_C+SF_C"
-  "qvhighlights_C+SF_C"
-  "tacos_C3D_GloVe"
+  "charades_VGG_GloVe_ambedy2"
 )
 
 cd "${REPO_DIR}" || {
